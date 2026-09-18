@@ -73,6 +73,14 @@ def main():
     ap.add_argument("--text-max-length", type=int, default=512,
                     help="Tokenizer truncation length for text embeddings. "
                          "Part of the cache key.")
+    ap.add_argument("--ssl-pool", type=lambda x: x.lower() != "false",
+                    default=True)
+    ap.add_argument("--ssl-half", action="store_true")
+    ap.add_argument("--ssl-chunk-seconds", type=float, default=30.0)
+    ap.add_argument("--text-pool", choices=["mean", "cls", "none"],
+                        default="mean")
+    ap.add_argument("--embed-dtype", choices=["float16", "float32"],
+                        default="float16")
     args = ap.parse_args()
 
     # early exits
@@ -110,6 +118,11 @@ def main():
     cfg.epochs = args.epochs
     cfg.batch_size = args.batch_size
     cfg.lr = args.lr
+    cfg.ssl_pool = args.ssl_pool
+    cfg.ssl_half = args.ssl_half
+    cfg.ssl_chunk_seconds = args.ssl_chunk_seconds
+    cfg.text_pool = args.text_pool
+    cfg.embed_dtype = args.embed_dtype 
 
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     cfg.cache_dir.mkdir(parents=True, exist_ok=True)

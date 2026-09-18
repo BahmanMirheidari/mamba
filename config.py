@@ -89,6 +89,12 @@ class Config:
     _current_model_name: str = ""
     _current_fold: int = -1
 
+    ssl_pool: bool = True
+    ssl_half: bool = False
+    ssl_chunk_seconds: float = 30.0
+    text_pool: str = "mean"
+    embed_dtype: str = "float16"
+
     # ---- derived ----
     @property
     def resolved_label_col(self) -> str:
