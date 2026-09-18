@@ -211,7 +211,7 @@ python run.py \
     --n-folds 2 \
     --epochs 3 \
     --mode experiments
-    
+
 # 2) aggregate the OOF predictions
 python aggregate.py \
     --results-dir results \
@@ -221,3 +221,16 @@ python aggregate.py \
     --label-col diagnosis \
     --task classification --n-classes 2 \
     --aggregation-unit session
+
+
+Quick reference
+What you want   Command
+Default output  ./run.sh full classification 2 diagnosis
+Custom output   ./run.sh full classification 2 diagnosis --output-dir results_v2
+Custom output + cache   ./run.sh full classification 2 diagnosis --output-dir results_v2 --cache-dir cache_v2
+Swap the encoder    ./run.sh full classification 2 diagnosis --output-dir results_deberta --ssl-model microsoft/deberta-v3-base
+Regression  ./run.sh full regression 1 mmse --output-dir results_mmse
+Full grid   ./run.sh full classification 2 diagnosis --include-grid --output-dir results_grid
+Every invocation writes to its own --output-dir and reads/writes the shared --cache-dir. Two runs with the same cache reuse the extracted features; two runs with different caches stay isolated.
+
+

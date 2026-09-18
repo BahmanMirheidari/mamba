@@ -64,6 +64,15 @@ def main():
                     help="Include the 18-config novelty grid (slow).")
     ap.add_argument("--list-experiments", action="store_true")
     ap.add_argument("--list-ablations", action="store_true")
+    ap.add_argument("--max-audio-seconds", type=float, default=30.0,
+                    help="Truncate each WAV to this many seconds before "
+                         "SSL encoding. Part of the cache key.")
+    ap.add_argument("--ssl-sample-rate", type=int, default=16000,
+                    help="Resample target for the SSL encoder. "
+                         "Part of the cache key.")
+    ap.add_argument("--text-max-length", type=int, default=512,
+                    help="Tokenizer truncation length for text embeddings. "
+                         "Part of the cache key.")
     args = ap.parse_args()
 
     # early exits

@@ -52,6 +52,7 @@ class Config:
     ssl_model_name: str = "facebook/wav2vec2-base-960h"
     ssl_sample_rate: int = 16000
     max_audio_seconds: float = 30.0
+    text_max_length: int = 512
     text_model_names: List[str] = field(default_factory=lambda: [
         "bert-base-uncased",
         "emilyalsentzer/Bio_ClinicalBERT",

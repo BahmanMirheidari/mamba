@@ -44,7 +44,10 @@ def extract_ssl_embeddings(df: pd.DataFrame, cfg) -> Dict[str, np.ndarray]:
     import torchaudio
     from transformers import Wav2Vec2Model, HubertModel, WhisperModel
 
-    cache = Path(cfg.cache_dir) / "ssl"
+    safe = (cfg.ssl_model_name.replace("/", "_")
+            + f"_sr{cfg.ssl_sample_rate}"
+            + f"_max{int(cfg.max_audio_seconds)}")
+    cache = Path(cfg.cache_dir) / f"ssl_{safe}" 
     cache.mkdir(parents=True, exist_ok=True)
 
     name = cfg.ssl_model_name.lower()
@@ -102,7 +105,8 @@ def extract_text_embeddings(df: pd.DataFrame,
                             cfg) -> Dict[str, np.ndarray]:
     from transformers import AutoTokenizer, AutoModel
 
-    safe = model_name.replace("/", "_")
+    safe = (model_name.replace("/", "_")
+            + f"_len{cfg.text_max_length}")
     cache = Path(cfg.cache_dir) / f"text_{safe}"
     cache.mkdir(parents=True, exist_ok=True)
 
