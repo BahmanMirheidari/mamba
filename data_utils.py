@@ -8,6 +8,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import csv
 import pandas as pd
+import json
+from pathlib import Path
 from sklearn.model_selection import GroupKFold, StratifiedGroupKFold
 
 
@@ -135,6 +137,17 @@ def build_master_table(cfg) -> pd.DataFrame:
     if unmatched:
         print(f"[data] WARNING: {len(unmatched)} WAV files were skipped")
 
+    # map labels to a stable integer index and remember the mapping
+    labels = sorted(df["label"].unique())
+    label2idx = {l: i for i, l in enumerate(labels)}
+    df["label"] = df["label"].map(label2idx).astype(int)
+    df.attrs["label2idx"] = label2idx
+    print(f"[data] label2idx = {label2idx}")
+
+    Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
+    (Path(cfg.output_dir) / "label2idx.json").write_text(
+        json.dumps({str(k): int(v) for k, v in label2idx.items()}, indent=2))
+
     n_spk = df["speaker_id"].nunique()
     n_ses = df.groupby(["speaker_id", "session_id"]).ngroups
     n_q = df.groupby(["speaker_id", "session_id", "question_id"]).ngroups
@@ -220,35 +233,51 @@ def aggregate_to_unit(df_eval: pd.DataFrame,
 
     return np.asarray(agg_preds), np.asarray(agg_labels), agg_keys
 
-def save_oof_predictions(out_dir, model_name, fold_i,
-                         df_eval, preds, task):
+def save_oof_predictions(out_dir, model_name: str, fold_i: int,
+                         df_eval: pd.DataFrame,
+                         task: str,
+                         probs: np.ndarray = None,
+                         logits: np.ndarray = None,
+                         y_pred: np.ndarray = None) -> Path:
     """
-    Dump per-file predictions for one fold.
-    Columns: file_stem, speaker_id, session_id, question_id,
-             y_true, y_pred [, prob_0, prob_1, ... for classification]
+    Persist per-file predictions for one fold.
+
+    Classification: pass `probs` [n, C] and optionally `logits` [n, C].
+                    y_pred is derived from probs if not given.
+    Regression:     pass `y_pred` [n].
+
+    Columns written:
+      file_stem, speaker_id, session_id, question_id, y_true, y_pred
+      (classification)  logit_0..logit_{C-1}, prob_0..prob_{C-1}
     """
+    import csv
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"{model_name}_fold{fold_i}.csv"
 
     df = df_eval.reset_index(drop=True)
+
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         header = ["file_stem", "speaker_id", "session_id",
                   "question_id", "y_true", "y_pred"]
         if task == "classification":
-            C = preds.shape[1]
+            C = probs.shape[1]
+            header += [f"logit_{c}" for c in range(C)]
             header += [f"prob_{c}" for c in range(C)]
         w.writerow(header)
+
         for i, row in df.iterrows():
             if task == "classification":
-                y_pred = int(np.argmax(preds[i]))
-                probs = preds[i].tolist()
+                p = probs[i]
+                lp = logits[i] if logits is not None else p
+                pred = int(np.argmax(p)) if y_pred is None else int(y_pred[i])
                 w.writerow([row["file_stem"], row["speaker_id"],
                             row["session_id"], row["question_id"],
-                            row["label"], y_pred] + probs)
+                            row["label"], pred]
+                           + list(lp) + list(p))
             else:
                 w.writerow([row["file_stem"], row["speaker_id"],
                             row["session_id"], row["question_id"],
-                            row["label"], float(preds[i])])
+                            row["label"], float(y_pred[i])])
     return path

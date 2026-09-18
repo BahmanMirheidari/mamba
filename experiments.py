@@ -65,15 +65,34 @@ def run_classical_experiment(name, model_type, df, folds, cfg, pooled):
 
         _, pred = train_classical(X_tr, y_tr, X_va, model_type)
 
-        # ---- persist OOF immediately (no early stopping here) ----
+        # ---- derive pseudo-logits from probs ----
+        prob_arr = np.asarray(pred, dtype=float)
+        if cfg.task == "classification":
+            eps = 1e-7
+            p_clipped = np.clip(prob_arr, eps, 1 - eps)
+            logit_arr = np.log(p_clipped / (1 - p_clipped))
+        else:
+            logit_arr = None
+
+        # ---- persist OOF ----
         try:
-            save_oof_predictions(
-                out_dir=Path(cfg.output_dir) / "oof",
-                model_name=name,
-                fold_i=fold_i,
-                df_eval=df_va_k,
-                preds=pred,
-                task=cfg.task)
+            if cfg.task == "classification":
+                save_oof_predictions(
+                    out_dir=Path(cfg.output_dir) / "oof",
+                    model_name=name,
+                    fold_i=fold_i,
+                    df_eval=df_va_k,
+                    task=cfg.task,
+                    probs=prob_arr,
+                    logits=logit_arr)
+            else:
+                save_oof_predictions(
+                    out_dir=Path(cfg.output_dir) / "oof",
+                    model_name=name,
+                    fold_i=fold_i,
+                    df_eval=df_va_k,
+                    task=cfg.task,
+                    y_pred=prob_arr)
         except Exception as e:
             print(f"  [OOF] save failed: {e}")
 
@@ -89,6 +108,7 @@ def run_classical_experiment(name, model_type, df, folds, cfg, pooled):
 
     summary = aggregate_fold_metrics(fold_metrics)
     return fold_metrics, summary
+
 
 
 # =====================================================================
@@ -121,7 +141,7 @@ def run_sequence_experiment(name, model_builder, df, folds, cfg,
     for fold_i, (tr_idx, va_idx) in enumerate(folds):
         cfg._current_model_name = name
         cfg._current_fold = fold_i 
-        
+
         df_tr = df.loc[tr_idx].reset_index(drop=True)
         df_va = df.loc[va_idx].reset_index(drop=True)
 

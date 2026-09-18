@@ -125,9 +125,9 @@ def train_one_fold(model, train_loader, val_loader, cfg,
     best_val = float("inf")
     best_state = None
     best_outputs = None
-    best_oof = None                              # <-- new
+    best_oof = None 
     wait = 0
-    history = []
+    history = [] 
 
     for ep in range(1, cfg.epochs + 1):
         # ---------------- training ----------------
@@ -143,24 +143,16 @@ def train_one_fold(model, train_loader, val_loader, cfg,
                 out = model(batch["audio_seq"], batch["audio_mask"],
                             batch["text_seq"], batch["text_mask"],
                             batch["tabular"])
-                if isinstance(out, tuple):
-                    logits = out[0]
-                    extras = out[1] if len(out) > 1 else {}
-                else:
-                    logits, extras = out, {}
-
+                logits = out[0] if isinstance(out, tuple) else out
+                extras = out[1] if isinstance(out, tuple) and len(out) > 1 else {}
                 if task == "classification":
                     loss = criterion(logits, batch["label"].long())
                 else:
                     loss = criterion(logits.squeeze(-1),
                                      batch["label"].float())
-
-                aux = None
-                if isinstance(extras, dict):
-                    aux = extras.get("aux_loss", None)
+                aux = extras.get("aux_loss") if isinstance(extras, dict) else None
                 if isinstance(aux, torch.Tensor):
                     loss = loss + aux
-
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -173,7 +165,7 @@ def train_one_fold(model, train_loader, val_loader, cfg,
         # ---------------- validation ----------------
         model.eval()
         va_loss = 0.0
-        va_preds, va_stems = [], []
+        va_logits_list, va_probs_list, va_stems = [], [], []
         with torch.no_grad():
             for batch in val_loader:
                 for k in ("audio_seq", "audio_mask", "text_seq",
@@ -187,25 +179,35 @@ def train_one_fold(model, train_loader, val_loader, cfg,
                     logits = out[0] if isinstance(out, tuple) else out
                     if task == "classification":
                         loss = criterion(logits, batch["label"].long())
-                        preds = torch.softmax(logits, -1).cpu().numpy()
+                        probs = torch.softmax(logits, -1)
                     else:
                         loss = criterion(logits.squeeze(-1),
                                          batch["label"].float())
-                        preds = logits.squeeze(-1).cpu().numpy()
+                        probs = logits.squeeze(-1)
                 va_loss += loss.item() * batch["label"].size(0)
-                va_preds.append(preds)
+                va_logits_list.append(logits.detach().cpu().numpy())
+                va_probs_list.append(probs.detach().cpu().numpy())
                 va_stems.extend(batch["stem"])
         va_loss /= len(val_loader.dataset)
-        va_preds = np.concatenate(va_preds, 0)
+        va_logits = np.concatenate(va_logits_list, 0)
+        va_probs = np.concatenate(va_probs_list, 0)
 
         order = {s: i for i, s in enumerate(va_stems)}
         vd = val_df[val_df["file_stem"].isin(order)].copy()
         vd["__p"] = vd["file_stem"].map(order)
         vd = vd.sort_values("__p").reset_index(drop=True)
-        aligned = va_preds[vd["__p"].values]
 
-        agg_preds, agg_labels, agg_keys = aggregate_to_unit(
-            vd, aligned, task, unit)
+        # align logits/probs row-for-row with vd
+        row_idx = vd["__p"].values
+        aligned_logits = va_logits[row_idx]
+        aligned_probs = va_probs[row_idx]
+
+        if task == "classification":
+            agg_preds, agg_labels, agg_keys = aggregate_to_unit(
+                vd, aligned_probs, task, unit)
+        else:
+            agg_preds, agg_labels, agg_keys = aggregate_to_unit(
+                vd, aligned_probs, task, unit)
 
         history.append({"epoch": ep, "train_loss": tr_loss,
                         "val_loss": va_loss})
@@ -218,7 +220,7 @@ def train_one_fold(model, train_loader, val_loader, cfg,
             best_state = {k: v.cpu().clone()
                           for k, v in model.state_dict().items()}
             best_outputs = (agg_preds, agg_labels, agg_keys)
-            best_oof = (vd.copy(), aligned.copy())    # <-- new
+            best_oof = (vd.copy(), aligned_probs.copy(), aligned_logits.copy())
             wait = 0
         else:
             wait += 1
@@ -230,19 +232,30 @@ def train_one_fold(model, train_loader, val_loader, cfg,
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    # ---------------- persist OOF at the best epoch ----------------
+    # ---------------- persist OOF at best epoch ----------------
     if best_oof is not None and getattr(cfg, "_current_model_name", ""):
+        vd_best, probs_best, logits_best = best_oof
         try:
-            path = save_oof_predictions(
-                out_dir=Path(cfg.output_dir) / "oof",
-                model_name=cfg._current_model_name,
-                fold_i=cfg._current_fold,
-                df_eval=best_oof[0],
-                preds=best_oof[1],
-                task=task)
+            if task == "classification":
+                path = save_oof_predictions(
+                    out_dir=Path(cfg.output_dir) / "oof",
+                    model_name=cfg._current_model_name,
+                    fold_i=cfg._current_fold,
+                    df_eval=vd_best,
+                    task=task,
+                    probs=probs_best,
+                    logits=logits_best)
+            else:
+                path = save_oof_predictions(
+                    out_dir=Path(cfg.output_dir) / "oof",
+                    model_name=cfg._current_model_name,
+                    fold_i=cfg._current_fold,
+                    df_eval=vd_best,
+                    task=task,
+                    y_pred=probs_best)
             if verbose:
-                print(f"  [OOF] saved {path.name} ({len(best_oof[0])} rows)")
+                print(f"  [OOF] saved {path.name} ({len(vd_best)} rows)")
         except Exception as e:
             print(f"  [OOF] save failed: {e}")
 
-    return (*best_outputs, history)
+    return (*best_outputs, history) 
