@@ -178,25 +178,50 @@ def main():
 
     # ---- 2. features ----
     print(f"\n{'=' * 70}\nFEATURES\n{'=' * 70}")
-    print("\n[features] eGeMAPS ...")
-    egemaps_df = extract_egemaps(df, cfg)
 
-    print("\n[features] SSL audio embeddings ...")
-    audio_emb = extract_ssl_embeddings(df, cfg)
-
+    # ---- 2a. TEXT FIRST ----
     print("\n[features] text embeddings ...")
     text_emb = {}
     for mname in cfg.text_model_names:
-        try:
-            text_emb[mname] = extract_text_embeddings(df, mname, cfg)
-        except Exception as e:
-            print(f"  skipped {mname}: {e}")
+        emb = extract_text_embeddings(df, mname, cfg)   # has its own try/except
+        text_emb[mname] = emb
+        print(f"  {mname}: {len(emb)} sequences")
 
-    if not text_emb:
-        raise RuntimeError("No text embeddings produced.")
-    primary_text = list(text_emb.keys())[0]
-    text_emb_primary = text_emb[primary_text]
-    print(f"[features] using text encoder: {primary_text}")
+    if text_emb and any(len(v) > 0 for v in text_emb.values()):
+        primary_text = next(m for m, v in text_emb.items() if len(v) > 0)
+        text_emb_primary = text_emb[primary_text]
+        print(f"[features] using primary text encoder: {primary_text}")
+    else:
+        primary_text = None
+        text_emb_primary = None
+        print("[features] WARNING: no text embeddings; "
+              "continuing with SSL/eGeMAPS only.")
+
+    # ---- 2b. SSL ----
+    print("\n[features] SSL audio embeddings ...")
+    audio_emb = extract_ssl_embeddings(df, cfg)         # has its own try/except
+    print(f"  {cfg.ssl_model_name}: {len(audio_emb)} sequences")
+
+    # ---- 2c. eGeMAPS LAST ----
+    print("\n[features] eGeMAPS ...")
+    egemaps_df = extract_egemaps(df, cfg)               # has its own try/except
+    print(f"  egemaps: {len(egemaps_df)} rows")
+
+    # ---- 2d. cross-modal sanity check ----
+    n_text = sum(len(v) for v in text_emb.values())
+    n_ssl  = len(audio_emb)
+    n_eg   = len(egemaps_df)
+
+    print("\n[features] summary:")
+    print(f"  text   : {n_text} files across {len(text_emb)} model(s)")
+    print(f"  ssl    : {n_ssl} files")
+    print(f"  egemaps: {n_eg} files")
+
+    if n_text == 0 and n_ssl == 0 and n_eg == 0:
+        raise RuntimeError(
+            "All feature extractors returned empty results. "
+            "See tracebacks above."
+        )
 
     # ---- 3. experiments ----
     exp_results = {}
