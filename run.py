@@ -11,6 +11,14 @@ Modes
   --list-experiments   Print the default experiment names and exit.
   --list-ablations     Print the ablation labels and exit.
 """
+# --- numpy compat shim ---
+# np.long was removed in numpy 1.24 but some transformers code paths
+# (and their optional deps) still reference it.
+import numpy as _np
+if not hasattr(_np, "long"):
+    _np.long = int
+# --- end shim ---
+
 import argparse
 import json
 from pathlib import Path
@@ -51,7 +59,18 @@ def main():
     ap.add_argument("--n-folds", type=int, default=5)
     ap.add_argument("--ssl-model", type=str,
                     default="facebook/wav2vec2-base-960h")
-    ap.add_argument("--text-models", nargs="+", default=None)
+    ap.add_argument(
+        "--text-models",
+        nargs="+",
+        default=[
+            "emilyalsentzer/Bio_ClinicalBERT", 
+            "roberta-base",
+            "bert-base-uncased",  #roberta-large distilbert/distilroberta-base
+            "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext",     
+        ],
+        help="Hugging Face text encoders (one or more). "
+             "Omit to use all defaults.",
+    ) 
     ap.add_argument("--output-dir", type=str, default="results")
     ap.add_argument("--cache-dir", type=str, default="cache")
     ap.add_argument("--device", type=str, default="cuda")
