@@ -12,13 +12,35 @@ Modes
   --list-ablations     Print the ablation labels and exit.
 """
 # --- numpy compat shim ---
-# np.long was removed in numpy 1.24 but some transformers code paths
-# (and their optional deps) still reference it.
+# numpy 1.24 removed np.long, np.ulong, np.bool, np.int, np.float, etc.
+# numpy 2.0 removed more. Restore every commonly-referenced alias so that
+# older transformers/tokenizer code paths keep working.
 import numpy as _np
-if not hasattr(_np, "long"):
-    _np.long = int
-# --- end shim ---
 
+_aliases = {
+    "long":      int,
+    "ulong":     int,          # unsigned view; int is safe here
+    "bool":      bool,
+    "int":       int,
+    "float":     float,
+    "complex":   complex,
+    "object":    object,
+    "str":       str,
+    "unicode":   str,
+    "longlong":  _np.int64,
+    "ulonglong": _np.uint64,
+    "int_":      _np.int64,
+    "uint":      _np.uint64,
+    "ubyte":     _np.uint8,
+    "ushort":    _np.uint16,
+    "uintc":     _np.uint32,
+    "intc":      _np.int32,
+}
+for _name, _target in _aliases.items():
+    if not hasattr(_np, _name):
+        setattr(_np, _name, _target)
+del _name, _target
+# --- end shim ---
 import argparse
 import json
 from pathlib import Path
