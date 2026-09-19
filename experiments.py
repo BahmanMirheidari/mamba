@@ -151,9 +151,9 @@ def run_sequence_experiment(name, model_builder, df, folds, cfg,
         tab_tr = scaler.transform(tab_tr).astype(np.float32)
         tab_va = scaler.transform(tab_va).astype(np.float32)
 
-        d_a = next(iter(audio_emb.values())).shape[1]
-        d_t = next(iter(text_emb.values())).shape[1]
-        d_z = tab_tr.shape[1]
+        d_a = next(iter(audio_emb.values())).shape[-1]
+        d_t = next(iter(text_emb.values())).shape[-1]
+        d_z = tab_tr.shape[-1]
 
         model = model_builder(d_a, d_t, d_z, cfg)
 
@@ -288,8 +288,8 @@ def run_one_experiment(spec: ExperimentSpec, df, folds, cfg,
     egemaps_index = {s: i for i, s in enumerate(egemaps_df.index)}
 
     if spec.kind == "sequence" and spec.builder is None:
-        d_a = next(iter(audio_emb.values())).shape[1]
-        d_t = next(iter(text_emb.values())).shape[1]
+        d_a = next(iter(audio_emb.values())).shape[-1]
+        d_t = next(iter(text_emb.values())).shape[-1]
         use_audio = spec.use_audio
         builder = lambda a, t, z, c: _wrap_mamba(
             a if use_audio else t, c, use_audio)
