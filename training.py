@@ -347,11 +347,9 @@ def train_one_fold(model: nn.Module,
             df_pred = df_pred.merge(
                 val_df[["file_stem"] + keep_cols], on="file_stem", how="left")
 
-        agg = aggregate_to_unit(df_pred, cfg.resolved_aggregation_unit)
-        prob_cols = [c for c in agg.columns if c.startswith("prob_")]
-        agg_preds = agg[prob_cols].to_numpy(dtype=float).argmax(axis=1)
-        agg_labels = agg["y_true"].to_numpy()
-        agg_keys = agg.index.tolist()
+                
+        agg_preds, agg_labels, agg_keys = aggregate_to_unit(
+            df_pred, per_file_pred, cfg.task, cfg.resolved_aggregation_unit)
     else:
         per_file_pred = logits_arr.squeeze(-1) if logits_arr.ndim > 1 else logits_arr
         per_file_label = np.asarray(all_labels, dtype=float)
@@ -367,9 +365,7 @@ def train_one_fold(model: nn.Module,
             df_pred = df_pred.merge(
                 val_df[["file_stem"] + keep_cols], on="file_stem", how="left")
 
-        agg = aggregate_to_unit(df_pred, cfg.resolved_aggregation_unit)
-        agg_preds = agg["y_pred"].to_numpy(dtype=float)
-        agg_labels = agg["y_true"].to_numpy(dtype=float)
-        agg_keys = agg.index.tolist()
+        agg_preds, agg_labels, agg_keys = aggregate_to_unit(
+            df_pred, per_file_pred, cfg.task, cfg.resolved_aggregation_unit)
 
     return agg_preds, agg_labels, agg_keys, history
