@@ -11,7 +11,7 @@ DEMO_CSV="${DEMO_CSV:-./data/demo.csv}"
 TRANS_CSV="${TRANS_CSV:-./data/transcriptions.csv}"
 
 SSL_MODEL="${SSL_MODEL:-facebook/wav2vec2-base-960h}"
-DEVICE="${DEVICE:-cpu}"
+DEVICE="${DEVICE:-$(python -c 'import torch; print("cuda" if torch.cuda.is_available() else "cpu")')}"
 
 AGG_UNIT="${AGG_UNIT:-speaker}"
 SPEAKER_COL="${SPEAKER_COL:-speaker_id}"

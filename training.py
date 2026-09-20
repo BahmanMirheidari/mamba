@@ -3,16 +3,8 @@ training.py
 
 Dataset, collate, and single-fold training for the mamba pipeline.
 
-Compatible with:
-  - pooled  (D,)     or sequence (T, D) embeddings returned by
-    feature_extractors.LazyEmbeddings
-  - classification   and regression tasks
-  - torch 2.6 (new torch.amp.* API; no deprecated torch.cuda.amp.*)
-
-Exposes:
-  MultiModalDataset   torch Dataset; emits dicts with audio/text/tab/label
-  collate_pad         pads variable-length sequences in a batch
-  train_one_fold      full training + validation loop for a single fold
+Compatible with pooled (D,) and sequence (T, D) embeddings returned by
+feature_extractors.LazyEmbeddings. Uses torch 2.6's new torch.amp API.
 """
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -34,43 +26,17 @@ def _ensure_2d(x: np.ndarray) -> np.ndarray:
     return x[None, :] if x.ndim == 1 else x
 
 
-def _ensure_mask(m: np.ndarray, length: int) -> np.ndarray:
-    """Return a (length,) float mask. If input is empty, all ones."""
-    if m is None or m.size == 0:
-        return np.ones(length, dtype=np.float32)
-    return m.astype(np.float32)
-
-
 # =========================================================================
 # Dataset
 # =========================================================================
 class MultiModalDataset(Dataset):
     """
-    One sample per row of `df`.
-
-    Emits a dict:
-        {
-          'file_stem':  str,
-          'audio_seq':  FloatTensor (T_a, d_a),
-          'audio_mask': FloatTensor (T_a,),
-          'text_seq':   FloatTensor (T_t, d_t),
-          'text_mask':  FloatTensor (T_t,),
-          'tabular':    FloatTensor (d_z,),
-          'label':      LongTensor scalar (classification)
-                        FloatTensor scalar (regression)
-        }
-
-    Embeddings come from LazyEmbeddings views (`audio_emb`, `text_emb`).
-    Pooled vectors are auto-unsqueezed to (1, D) so downstream code
-    uniformly sees 2-D sequences.
+    One sample per row of df. Emits dicts with audio/text/tabular/label.
+    Auto-unsqueezes pooled vectors to (1, D) so downstream code always
+    sees 2-D sequences.
     """
 
-    def __init__(self,
-                 df: pd.DataFrame,
-                 audio_emb,
-                 text_emb,
-                 tabular: np.ndarray,
-                 cfg):
+    def __init__(self, df, audio_emb, text_emb, tabular, cfg):
         self.df = df.reset_index(drop=True)
         self.audio_emb = audio_emb
         self.text_emb = text_emb
@@ -78,65 +44,61 @@ class MultiModalDataset(Dataset):
         self.cfg = cfg
         self.task = cfg.task
 
-        # Label → integer mapping for classification.
-        # Set here so the val dataset can be pointed at this same mapping
-        # after construction (ds_va.label2idx = ds_tr.label2idx).
-        self.label2idx: Optional[Dict] = None
-        self.idx2label: Optional[Dict] = None
+        self.label2idx = None
+        self.idx2label = None
         if self.task == "classification":
             labels = sorted(self.df["label"].unique().tolist())
             self.label2idx = {l: i for i, l in enumerate(labels)}
             self.idx2label = {i: l for l, i in self.label2idx.items()}
 
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self.df)
 
-    def _label_for(self, row) -> torch.Tensor:
+    def _label_for(self, row):
         if self.task == "classification":
-            y = self.label2idx[row["label"]]
-            return torch.tensor(y, dtype=torch.long)
+            return torch.tensor(self.label2idx[row["label"]], dtype=torch.long)
         return torch.tensor(float(row["label"]), dtype=torch.float32)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx):
         row = self.df.iloc[idx]
         stem = row["file_stem"]
 
-        # --- audio ---
-        a = np.asarray(self.audio_emb[stem], dtype=np.float32)
-        a = _ensure_2d(a)                                    # (T_a, d_a)
-        a_mask = _ensure_mask(None, a.shape[0])
+        # Guard against stems missing from caches (fail early, clearly).
+        if stem not in self.audio_emb:
+            raise FileNotFoundError(
+                f"audio features missing for {stem} — pre-filter df before "
+                f"building the dataset")
+        if stem not in self.text_emb:
+            raise FileNotFoundError(
+                f"text features missing for {stem} — pre-filter df before "
+                f"building the dataset")
 
-        # --- text ---
+        a = np.asarray(self.audio_emb[stem], dtype=np.float32)
+        a = _ensure_2d(a)
+        am = np.ones(a.shape[0], dtype=np.float32)
+
         t = np.asarray(self.text_emb[stem], dtype=np.float32)
         t = _ensure_2d(t)
-        t_mask = _ensure_mask(None, t.shape[0])
-
-        # --- tabular ---
-        z = self.tabular[idx]
+        tm = np.ones(t.shape[0], dtype=np.float32)
 
         return {
             "file_stem":  stem,
             "audio_seq":  torch.from_numpy(a),
-            "audio_mask": torch.from_numpy(a_mask),
+            "audio_mask": torch.from_numpy(am),
             "text_seq":   torch.from_numpy(t),
-            "text_mask":  torch.from_numpy(t_mask),
-            "tabular":    torch.from_numpy(z),
+            "text_mask":  torch.from_numpy(tm),
+            "tabular":    torch.from_numpy(self.tabular[idx]),
             "label":      self._label_for(row),
         }
 
 
 # =========================================================================
-# Collate — pad variable-length sequences in a batch
+# Collate
 # =========================================================================
-def collate_pad(batch: List[Dict]) -> Dict[str, torch.Tensor]:
-    """
-    Pads audio_seq and text_seq to the batch max length.
-    Masks are concatenated with zeros in the padded region.
-    """
+def collate_pad(batch):
     B = len(batch)
     stems = [b["file_stem"] for b in batch]
 
-    # audio dims (works for both 1-D and 2-D inputs — dataset normalizes)
     da = batch[0]["audio_seq"].size(1)
     dt = batch[0]["text_seq"].size(1)
     dz = batch[0]["tabular"].size(0)
@@ -144,15 +106,15 @@ def collate_pad(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     max_a = max(b["audio_seq"].size(0) for b in batch)
     max_t = max(b["text_seq"].size(0) for b in batch)
 
-    A = torch.zeros(B, max_a, da)
+    A  = torch.zeros(B, max_a, da)
     AM = torch.zeros(B, max_a)
-    T = torch.zeros(B, max_t, dt)
+    T  = torch.zeros(B, max_t, dt)
     TM = torch.zeros(B, max_t)
-    Z = torch.zeros(B, dz)
+    Z  = torch.zeros(B, dz)
 
     for i, b in enumerate(batch):
-        a = b["audio_seq"]; am = b["audio_mask"]
-        t = b["text_seq"];  tm = b["text_mask"]
+        a, am = b["audio_seq"], b["audio_mask"]
+        t, tm = b["text_seq"], b["text_mask"]
         A[i, :a.size(0)] = a
         AM[i, :am.size(0)] = am
         T[i, :t.size(0)] = t
@@ -173,16 +135,9 @@ def collate_pad(batch: List[Dict]) -> Dict[str, torch.Tensor]:
 
 
 # =========================================================================
-# Model forward adapter
+# Forward adapter
 # =========================================================================
 def _forward(model, batch, device):
-    """
-    Call model(a, am, t, tm, z) and normalize the output.
-
-    Models in fusion.py and novelty.py return either:
-        - a tensor                       -> (logits, None, None)
-        - (logits, aux, aux2) tuple      -> unpacked
-    """
     a  = batch["audio_seq"].to(device)
     am = batch["audio_mask"].to(device)
     t  = batch["text_seq"].to(device)
@@ -202,52 +157,54 @@ def _forward(model, batch, device):
 
 
 # =========================================================================
+# Re-home any module buffers that ended up on the wrong device.
+# Fixes: "Expected x.is_cuda() to be true" from mamba-ssm.
+# =========================================================================
+def _rehome_buffers(model, device):
+    for name, buf in list(model.named_buffers(recurse=True)):
+        if buf is not None and buf.device != device:
+            # find the owning submodule and re-register
+            parts = name.split(".")
+            owner = model
+            for p in parts[:-1]:
+                owner = getattr(owner, p) if not p.isdigit() else owner[int(p)]
+            owner.register_buffer(parts[-1], buf.to(device))
+
+
+# =========================================================================
 # Single-fold training
 # =========================================================================
-def train_one_fold(model: nn.Module,
-                   train_loader,
-                   val_loader,
-                   cfg,
-                   val_df: Optional[pd.DataFrame] = None,
-                   verbose: bool = True
-                   ) -> Tuple[np.ndarray, np.ndarray, List, Dict]:
-    """
-    Trains `model` for cfg.epochs, evaluates on val_loader, writes OOF
-    predictions, and returns (agg_preds, agg_labels, agg_keys, history).
-    """
+def train_one_fold(model, train_loader, val_loader, cfg,
+                   val_df=None, verbose=True):
     device = torch.device(cfg.device)
     model = model.to(device)
 
-    # ---- loss ----
+    if device.type == "cuda":
+        _rehome_buffers(model, device)
+
     if cfg.task == "classification":
         criterion = nn.CrossEntropyLoss()
     else:
         criterion = nn.MSELoss()
 
-    # ---- optimizer ----
     opt = torch.optim.AdamW(
         model.parameters(),
         lr=getattr(cfg, "lr", 1e-4),
         weight_decay=getattr(cfg, "weight_decay", 1e-2),
     )
 
-    # ---- AMP (new API: torch.amp.GradScaler / torch.amp.autocast) ----
     use_amp = bool(getattr(cfg, "use_amp", False)) and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     history = {"train_loss": [], "val_loss": []}
 
-    # =====================================================================
-    # Training
-    # =====================================================================
+    # ---- train ----
     model.train()
     for epoch in range(int(cfg.epochs)):
         running = 0.0
         n_batches = 0
-
         for batch in train_loader:
             opt.zero_grad(set_to_none=True)
-
             with torch.amp.autocast("cuda", enabled=use_amp):
                 logits, _, _ = _forward(model, batch, device)
                 y = batch["label"].to(device)
@@ -256,117 +213,94 @@ def train_one_fold(model: nn.Module,
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
-                max_norm=getattr(cfg, "grad_clip", 1.0),
-            )
+                model.parameters(), max_norm=getattr(cfg, "grad_clip", 1.0))
             scaler.step(opt)
             scaler.update()
 
             running += float(loss.item())
             n_batches += 1
 
-        avg_train = running / max(n_batches, 1)
-        history["train_loss"].append(avg_train)
-
+        avg = running / max(n_batches, 1)
+        history["train_loss"].append(avg)
         if verbose:
-            print(f"    epoch {epoch + 1}/{cfg.epochs}  "
-                  f"train_loss={avg_train:.4f}")
+            print(f"    epoch {epoch+1}/{cfg.epochs}  train_loss={avg:.4f}")
 
-    # =====================================================================
-    # Validation — collect per-file predictions
-    # =====================================================================
+    # ---- val ----
     model.eval()
-    all_stems: List[str] = []
-    all_logits: List[np.ndarray] = []
-    all_probs: List[np.ndarray] = []
-    all_labels: List = []
+    all_stems, all_logits, all_probs, all_labels = [], [], [], []
 
     with torch.no_grad():
         for batch in val_loader:
             with torch.amp.autocast("cuda", enabled=use_amp):
                 logits, _, _ = _forward(model, batch, device)
-
             logits = logits.float().cpu().numpy()
             all_stems.extend(batch["file_stem"])
             all_logits.append(logits)
             all_labels.extend(batch["label"].cpu().numpy().tolist())
-
             if cfg.task == "classification":
                 p = torch.softmax(torch.from_numpy(logits), dim=-1).numpy()
                 all_probs.append(p)
 
-    logits_arr = np.concatenate(all_logits, axis=0) if all_logits else np.zeros((0, 0))
+    logits_arr = (np.concatenate(all_logits, axis=0)
+                  if all_logits else np.zeros((0, 0)))
 
-    # ---- save OOF per file ----
+    # ---- OOF ----
     try:
         out_dir = Path(cfg.output_dir) / "oof"
         fold_i = int(getattr(cfg, "_current_fold", 0))
         model_name = str(getattr(cfg, "_current_model_name", "model"))
 
         if val_df is not None:
-            # Match rows in the same order as we collected predictions
-            df_eval = val_df.set_index("file_stem").loc[all_stems].reset_index()
+            df_eval = (val_df.set_index("file_stem")
+                       .loc[all_stems].reset_index())
         else:
             df_eval = pd.DataFrame({"file_stem": all_stems})
 
         if cfg.task == "classification":
             save_oof_predictions(
-                out_dir=out_dir,
-                model_name=model_name,
-                fold_i=fold_i,
-                df_eval=df_eval,
-                task=cfg.task,
+                out_dir=out_dir, model_name=model_name, fold_i=fold_i,
+                df_eval=df_eval, task=cfg.task,
                 probs=np.concatenate(all_probs, axis=0),
-                logits=logits_arr,
-            )
+                logits=logits_arr)
         else:
+            yp = logits_arr.squeeze(-1) if logits_arr.ndim > 1 else logits_arr
             save_oof_predictions(
-                out_dir=out_dir,
-                model_name=model_name,
-                fold_i=fold_i,
-                df_eval=df_eval,
-                task=cfg.task,
-                y_pred=logits_arr.squeeze(-1) if logits_arr.ndim > 1 else logits_arr,
-            )
+                out_dir=out_dir, model_name=model_name, fold_i=fold_i,
+                df_eval=df_eval, task=cfg.task, y_pred=yp)
     except Exception as e:
         print(f"    [OOF] save failed: {e}")
 
-    # ---- aggregate to unit and return ----
+    # ---- aggregate to unit ----
     if cfg.task == "classification":
-        per_file_pred = np.concatenate(all_probs, axis=0)          # (N, C)
-        per_file_label = np.asarray(all_labels)                    # (N,)
-        # reconstruct a DataFrame with prob_* columns for aggregate_to_unit
+        per_file_pred = np.concatenate(all_probs, axis=0)
         df_pred = pd.DataFrame({"file_stem": all_stems})
         for c in range(per_file_pred.shape[1]):
             df_pred[f"prob_{c}"] = per_file_pred[:, c]
-        df_pred["y_true"] = per_file_label
+        df_pred["y_true"] = np.asarray(all_labels)
         df_pred["y_pred"] = per_file_pred.argmax(axis=1)
         if val_df is not None:
-            keep_cols = [c for c in ("speaker_id", "session_id", "question_id")
-                         if c in val_df.columns]
+            keep = [c for c in ("speaker_id", "session_id", "question_id")
+                    if c in val_df.columns]
             df_pred = df_pred.merge(
-                val_df[["file_stem"] + keep_cols], on="file_stem", how="left")
-
+                val_df[["file_stem"] + keep], on="file_stem", how="left")
         agg = aggregate_to_unit(df_pred, cfg.resolved_aggregation_unit)
         prob_cols = [c for c in agg.columns if c.startswith("prob_")]
         agg_preds = agg[prob_cols].to_numpy(dtype=float).argmax(axis=1)
         agg_labels = agg["y_true"].to_numpy()
         agg_keys = agg.index.tolist()
     else:
-        per_file_pred = logits_arr.squeeze(-1) if logits_arr.ndim > 1 else logits_arr
-        per_file_label = np.asarray(all_labels, dtype=float)
-
+        per_file_pred = (logits_arr.squeeze(-1)
+                         if logits_arr.ndim > 1 else logits_arr)
         df_pred = pd.DataFrame({
             "file_stem": all_stems,
-            "y_true":    per_file_label,
+            "y_true":    np.asarray(all_labels, dtype=float),
             "y_pred":    per_file_pred,
         })
         if val_df is not None:
-            keep_cols = [c for c in ("speaker_id", "session_id", "question_id")
-                         if c in val_df.columns]
+            keep = [c for c in ("speaker_id", "session_id", "question_id")
+                    if c in val_df.columns]
             df_pred = df_pred.merge(
-                val_df[["file_stem"] + keep_cols], on="file_stem", how="left")
-
+                val_df[["file_stem"] + keep], on="file_stem", how="left")
         agg = aggregate_to_unit(df_pred, cfg.resolved_aggregation_unit)
         agg_preds = agg["y_pred"].to_numpy(dtype=float)
         agg_labels = agg["y_true"].to_numpy(dtype=float)

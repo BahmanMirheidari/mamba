@@ -43,134 +43,161 @@ with _warnings.catch_warnings():
 
 del _name, _target, _warnings
 # --- end shim ---
+
 import argparse
-import json
+import os
+import sys
+import traceback
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
 
-from config import Config
 from data_utils import build_master_table, grouped_folds
 from feature_extractors import (extract_egemaps, extract_ssl_embeddings,
-                                extract_text_embeddings)
-from experiments import (default_experiments, run_all_experiments)
-from ablations import (ABLATION_PRESETS, run_ablation_study,
-                       run_ablation_grid)
-from reporting import (comparison_table, ablation_table, significance_table,
-                       plot_comparison_bar, plot_ablation_bar,
-                       save_tables, save_json)
+                                extract_text_embeddings, LazyEmbeddings)
+from experiments import default_experiments, run_all_experiments
 
 
-def main():
-    ap = argparse.ArgumentParser(
-        description="Leakage-free multi-modal clinical speech pipeline "
-                    "with experiment and ablation runners.")
-    ap.add_argument("--wav-dir", type=str, required=True)
-    ap.add_argument("--demo-csv", type=str, required=True)
-    ap.add_argument("--transcriptions-csv", type=str, required=True)
-    ap.add_argument("--label-col", type=str, default=None)
-    ap.add_argument("--speaker-col", type=str, default="speaker_id")
-    ap.add_argument("--session-col", type=str, default=None)
-    ap.add_argument("--transcript-file-col", type=str, default="utt_id")
-    ap.add_argument("--transcript-text-col", type=str, default="transcript")
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--wav-dir", required=True)
+    ap.add_argument("--demo-csv", required=True)
+    ap.add_argument("--transcriptions-csv", required=True)
+    ap.add_argument("--label-col", default="label")
+    ap.add_argument("--speaker-col", default=None)
+    ap.add_argument("--session-col", default=None)
+    ap.add_argument("--transcript-file-col", default="file_stem")
+    ap.add_argument("--transcript-text-col", default="transcript")
     ap.add_argument("--task", choices=["classification", "regression"],
                     default="classification")
     ap.add_argument("--n-classes", type=int, default=2)
     ap.add_argument("--aggregation-unit",
                     choices=["auto", "question", "session", "speaker"],
-                    default="auto")
-    ap.add_argument("--n-folds", type=int, default=5)
-    ap.add_argument("--ssl-model", type=str,
-                    default="facebook/wav2vec2-base-960h")
-    ap.add_argument(
-        "--text-models",
-        nargs="+",
-        default=[
-            "emilyalsentzer/Bio_ClinicalBERT", 
-            "roberta-base",
-            "bert-base-uncased",  #roberta-large distilbert/distilroberta-base
-            "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext",     
-        ],
-        help="Hugging Face text encoders (one or more). "
-             "Omit to use all defaults.",
-    ) 
-    ap.add_argument("--output-dir", type=str, default="results")
-    ap.add_argument("--cache-dir", type=str, default="cache")
-    ap.add_argument("--device", type=str, default="cuda")
-    ap.add_argument("--epochs", type=int, default=50)
-    ap.add_argument("--batch-size", type=int, default=16)
+                    default="speaker")
+    ap.add_argument("--n-folds", type=int, default=2)
+    ap.add_argument("--ssl-model", default="facebook/wav2vec2-base-960h")
+    ap.add_argument("--text-models", nargs="+",
+                    default=["emilyalsentzer/Bio_ClinicalBERT"])
+    ap.add_argument("--output-dir", default="results")
+    ap.add_argument("--cache-dir", default="cache")
+    ap.add_argument("--device",
+                    default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--epochs", type=int, default=10)
+    ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--mode", choices=["experiments", "ablation", "full"],
                     default="experiments")
-    ap.add_argument("--include-grid", action="store_true",
-                    help="Include the 18-config novelty grid (slow).")
+    ap.add_argument("--include-grid", action="store_true")
     ap.add_argument("--list-experiments", action="store_true")
     ap.add_argument("--list-ablations", action="store_true")
-    ap.add_argument("--max-audio-seconds", type=float, default=30.0,
-                    help="Truncate each WAV to this many seconds before "
-                         "SSL encoding. Part of the cache key.")
-    ap.add_argument("--ssl-sample-rate", type=int, default=16000,
-                    help="Resample target for the SSL encoder. "
-                         "Part of the cache key.")
-    ap.add_argument("--text-max-length", type=int, default=512,
-                    help="Tokenizer truncation length for text embeddings. "
-                         "Part of the cache key.")
+    ap.add_argument("--max-audio-seconds", type=float, default=30.0)
+    ap.add_argument("--ssl-sample-rate", type=int, default=16000)
+    ap.add_argument("--text-max-length", type=int, default=512)
     ap.add_argument("--ssl-pool", type=lambda x: x.lower() != "false",
                     default=True)
     ap.add_argument("--ssl-half", action="store_true")
     ap.add_argument("--ssl-chunk-seconds", type=float, default=30.0)
     ap.add_argument("--text-pool", choices=["mean", "cls", "none"],
-                        default="mean")
+                    default="mean")
     ap.add_argument("--embed-dtype", choices=["float16", "float32"],
-                        default="float16")
-    args = ap.parse_args()
+                    default="float16")
+    return ap.parse_args()
 
-    # early exits
-    if args.list_experiments:
-        print("Default experiments:")
-        for spec in default_experiments():
-            print(f"  {spec.name:20s}  [{spec.family:8s}]  "
-                  f"{spec.description}")
-        return
-    if args.list_ablations:
-        print("Ablation presets:")
-        for label, preset in ABLATION_PRESETS.items():
-            print(f"  {label:22s}  (novelty preset '{preset}')")
-        return
 
+# ---------------------------------------------------------------------------
+# Config bridge
+# ---------------------------------------------------------------------------
+class Config:
+    pass
+
+
+def build_cfg(args):
     cfg = Config()
-    cfg.wav_dir = Path(args.wav_dir)
-    cfg.demo_csv = Path(args.demo_csv)
-    cfg.transcriptions_csv = Path(args.transcriptions_csv)
-    cfg.label_col = args.label_col
-    cfg.speaker_col = args.speaker_col
-    cfg.session_col = args.session_col
-    cfg.transcript_file_col = args.transcript_file_col
-    cfg.transcript_text_col = args.transcript_text_col
-    cfg.task = args.task
-    cfg.n_classes = args.n_classes
-    cfg.aggregation_unit = args.aggregation_unit
-    cfg.n_folds = args.n_folds
-    cfg.ssl_model_name = args.ssl_model
-    if args.text_models:
-        cfg.text_model_names = args.text_models
-    cfg.output_dir = Path(args.output_dir)
-    cfg.cache_dir = Path(args.cache_dir)
-    cfg.device = args.device
-    cfg.epochs = args.epochs
-    cfg.batch_size = args.batch_size
-    cfg.lr = args.lr
-    cfg.ssl_pool = args.ssl_pool
-    cfg.ssl_half = args.ssl_half
-    cfg.ssl_chunk_seconds = args.ssl_chunk_seconds
-    cfg.text_pool = args.text_pool
-    cfg.embed_dtype = args.embed_dtype 
+    for k, v in vars(args).items():
+        setattr(cfg, k, v)
+    cfg.text_model_names = list(args.text_models)
+    cfg.n_outputs = args.n_classes if args.task == "classification" else 1
+    cfg.resolved_aggregation_unit = (
+        "speaker" if args.aggregation_unit == "auto"
+        else args.aggregation_unit)
+    cfg.use_amp = True
+    cfg.weight_decay = 1e-2
+    cfg.grad_clip = 1.0
+    # fusion defaults
+    cfg.fusion_d_model = getattr(args, "fusion_d_model", 128)
+    cfg.fusion_dropout = getattr(args, "fusion_dropout", 0.1)
+    cfg.fusion_n_heads = getattr(args, "fusion_n_heads", 4)
+    # mamba defaults
+    cfg.mamba_d_model = getattr(args, "mamba_d_model", 128)
+    cfg.mamba_n_layers = getattr(args, "mamba_n_layers", 4)
+    cfg.mamba_d_state = getattr(args, "mamba_d_state", 16)
+    cfg.mamba_d_conv = getattr(args, "mamba_d_conv", 4)
+    cfg.mamba_expand = getattr(args, "mamba_expand", 2)
+    cfg.mamba_dropout = getattr(args, "mamba_dropout", 0.1)
+    return cfg
 
-    cfg.output_dir.mkdir(parents=True, exist_ok=True)
-    cfg.cache_dir.mkdir(parents=True, exist_ok=True)
-    tables_dir = cfg.output_dir / "tables"
-    figs_dir = cfg.output_dir / "figures"
+
+# ---------------------------------------------------------------------------
+# Stem utilities
+# ---------------------------------------------------------------------------
+def _keys(obj):
+    if obj is None:
+        return set()
+    if hasattr(obj, "keys"):
+        return set(obj.keys())
+    if isinstance(obj, pd.DataFrame):
+        return set(obj.index)
+    return set()
+
+
+def filter_df_to_caches(df, folds, cfg, text_emb, audio_emb, egemaps_df):
+    """Keep only rows present in every non-empty feature source."""
+    sources = [*text_emb.values(), audio_emb, egemaps_df]
+    valid = None
+    for s in sources:
+        ks = _keys(s)
+        if not ks:
+            continue
+        valid = ks if valid is None else (valid & ks)
+
+    if valid is None:
+        raise RuntimeError("No feature source produced any stems.")
+
+    before = len(df)
+    df = df[df["file_stem"].isin(valid)].reset_index(drop=True)
+    if len(df) < before:
+        print(f"[features] dropped {before - len(df)} rows missing from caches")
+    folds = grouped_folds(df, cfg)
+    return df, folds
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main():
+    args = parse_args()
+    cfg = build_cfg(args)
+
+    if args.list_experiments:
+        for s in default_experiments():
+            print(f"{s.name:20s}  {s.family:9s}  {s.description}")
+        return
+
+    Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
+    Path(cfg.cache_dir).mkdir(parents=True, exist_ok=True)
+
+    print(f"\n{'=' * 70}\nCONFIG\n{'=' * 70}")
+    print(f"  task    : {cfg.task}")
+    print(f"  device  : {cfg.device}")
+    print(f"  ssl     : {cfg.ssl_model}")
+    print(f"  text    : {cfg.text_model_names}")
+    print(f"  pool    : ssl={cfg.ssl_pool}  text={cfg.text_pool}")
+    print(f"  dtype   : {cfg.embed_dtype}")
 
     # ---- 1. data ----
     print(f"\n{'=' * 70}\nDATA\n{'=' * 70}")
@@ -178,105 +205,69 @@ def main():
     folds = grouped_folds(df, cfg)
     df = df.reset_index(drop=True)
 
-    # ---- 2. features ----
+    # ---- 2. features: TEXT -> SSL -> eGeMAPS ----
     print(f"\n{'=' * 70}\nFEATURES\n{'=' * 70}")
 
-    # ---- 2a. TEXT FIRST ----
+    # 2a. text
     print("\n[features] text embeddings ...")
     text_emb = {}
     for mname in cfg.text_model_names:
-        emb = extract_text_embeddings(df, mname, cfg)   # has its own try/except
+        emb = extract_text_embeddings(df, mname, cfg)
         text_emb[mname] = emb
         print(f"  {mname}: {len(emb)} sequences")
 
     if text_emb and any(len(v) > 0 for v in text_emb.values()):
         primary_text = next(m for m, v in text_emb.items() if len(v) > 0)
-        text_emb_primary = text_emb[primary_text]
-        print(f"[features] using primary text encoder: {primary_text}")
+        print(f"[features] primary text: {primary_text}")
     else:
         primary_text = None
-        text_emb_primary = None
         print("[features] WARNING: no text embeddings; "
-              "continuing with SSL/eGeMAPS only.")
+              "continuing without text")
 
-    # ---- 2b. SSL ----
+    # 2b. ssl
     print("\n[features] SSL audio embeddings ...")
-    audio_emb = extract_ssl_embeddings(df, cfg)         # has its own try/except
-    print(f"  {cfg.ssl_model_name}: {len(audio_emb)} sequences")
+    audio_emb = extract_ssl_embeddings(df, cfg)
+    print(f"  {cfg.ssl_model}: {len(audio_emb)} sequences")
 
-    # ---- 2c. eGeMAPS LAST ----
+    # 2c. egemaps
     print("\n[features] eGeMAPS ...")
-    egemaps_df = extract_egemaps(df, cfg)               # has its own try/except
+    egemaps_df = extract_egemaps(df, cfg)
     print(f"  egemaps: {len(egemaps_df)} rows")
 
-    # ---- 2d. cross-modal sanity check ----
+    # ---- 3. cross-source sanity + df filter ----
     n_text = sum(len(v) for v in text_emb.values())
-    n_ssl  = len(audio_emb)
-    n_eg   = len(egemaps_df)
-
-    print("\n[features] summary:")
-    print(f"  text   : {n_text} files across {len(text_emb)} model(s)")
-    print(f"  ssl    : {n_ssl} files")
-    print(f"  egemaps: {n_eg} files")
+    n_ssl = len(audio_emb)
+    n_eg = len(egemaps_df)
+    print(f"\n[features] summary: text={n_text} ssl={n_ssl} egemaps={n_eg}")
 
     if n_text == 0 and n_ssl == 0 and n_eg == 0:
-        raise RuntimeError(
-            "All feature extractors returned empty results. "
-            "See tracebacks above."
-        )
+        raise RuntimeError("All feature extractors produced empty results.")
 
-    # ---- 3. experiments ----
-    exp_results = {}
-    if args.mode in ("experiments", "full"):
-        print(f"\n{'=' * 70}\nEXPERIMENTS\n{'=' * 70}")
-        exp_results = run_all_experiments(
-            df, folds, cfg, egemaps_df, audio_emb, text_emb_primary,
-            primary_text)
+    df, folds = filter_df_to_caches(df, folds, cfg, text_emb, audio_emb,
+                                    egemaps_df)
+    print(f"[features] working set: {len(df)} rows, {len(folds)} folds")
 
-    # ---- 4. ablations ----
-    ab_results = {}
-    if args.mode in ("ablation", "full"):
-        print(f"\n{'=' * 70}\nABLATION STUDY\n{'=' * 70}")
-        ab_results = run_ablation_study(
-            df, folds, cfg, egemaps_df, audio_emb, text_emb_primary)
+    # ---- 4. experiments ----
+    print(f"\n{'=' * 70}\nEXPERIMENTS\n{'=' * 70}")
+    results = run_all_experiments(
+        df, folds, cfg, egemaps_df, audio_emb, text_emb, primary_text)
 
-        if args.include_grid:
-            print(f"\n{'=' * 70}\nNOVELTY GRID (2×3×3)\n{'=' * 70}")
-            grid = run_ablation_grid(
-                df, folds, cfg, egemaps_df, audio_emb, text_emb_primary)
-            for k, v in grid.items():
-                ab_results[f"grid_{k}"] = v
-
-    # ---- 5. reporting ----
-    print(f"\n{'=' * 70}\nREPORTING\n{'=' * 70}")
-
-    comp_df = comparison_table(exp_results, cfg) if exp_results else None
-    ab_df = ablation_table(ab_results, "full", cfg) if ab_results else None
-    sig_df = (significance_table(exp_results, "tcm_mamba", cfg)
-              if exp_results and "tcm_mamba" in exp_results else None)
-
-    if comp_df is not None and not comp_df.empty:
-        print("\nComparison table:")
-        print(comp_df.to_string(index=False))
-    if ab_df is not None and not ab_df.empty:
-        print("\nAblation table:")
-        print(ab_df.to_string(index=False))
-    if sig_df is not None and not sig_df.empty:
-        print("\nSignificance vs tcm_mamba:")
-        print(sig_df.to_string(index=False))
-
-    figs_dir.mkdir(parents=True, exist_ok=True)
-    if exp_results:
-        plot_comparison_bar(exp_results, cfg, figs_dir)
-    if ab_df is not None and not ab_df.empty:
-        plot_ablation_bar(ab_df, cfg, figs_dir)
-
-    save_tables(comp_df, ab_df, sig_df, tables_dir)
-    save_json(exp_results, ab_results, cfg,
-              cfg.output_dir / "results.json")
-
-    print(f"\n[done] outputs in {cfg.output_dir}")
+    # ---- 5. save results summary ----
+    out = Path(cfg.output_dir) / "results_summary.csv"
+    rows = []
+    for name, r in results.items():
+        for f in r.get("folds", []):
+            row = {"model": name, "family": r["family"]}
+            row.update({k: v for k, v in f.items() if not isinstance(v, dict)})
+            rows.append(row)
+    if rows:
+        pd.DataFrame(rows).to_csv(out, index=False)
+        print(f"\n[report] wrote {out}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        traceback.print_exc()
+        sys.exit(1)
