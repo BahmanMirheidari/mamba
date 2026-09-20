@@ -9,10 +9,31 @@ import numpy as np
 import csv
 import pandas as pd
 import json
-from pathlib import Path
 from sklearn.model_selection import GroupKFold, StratifiedGroupKFold
 
 
+# ---------------------------------------------------------------------------
+# Speaker ID padding
+# ---------------------------------------------------------------------------
+def _pad_speaker(s: str, width: int = 5) -> str:
+    """
+    'R_13' -> 'R_00013'. Zero-pads the numeric part of a 'PREFIX_NUM' ID
+    to `width` digits. Leaves non-numeric or already-long IDs alone.
+
+    This bridges the demo (speaker_id='R_13') and the WAV filenames /
+    transcripts (utt_id='R_00013_...').
+    """
+    if not isinstance(s, str) or "_" not in s:
+        return s
+    head, num = s.split("_", 1)
+    if not num.isdigit() or len(num) >= width:
+        return s
+    return f"{head}_{num.zfill(width)}"
+
+
+# ---------------------------------------------------------------------------
+# Filename parsing
+# ---------------------------------------------------------------------------
 def parse_filename(stem: str, pattern: str) -> Optional[Dict[str, Optional[str]]]:
     m = re.match(pattern, stem)
     if not m:
@@ -21,9 +42,13 @@ def parse_filename(stem: str, pattern: str) -> Optional[Dict[str, Optional[str]]
     return {k: (v if v else None) for k, v in d.items()}
 
 
+# ---------------------------------------------------------------------------
+# Transcripts
+# ---------------------------------------------------------------------------
 def load_transcriptions_csv(path: Path,
                             file_col: str,
                             text_col: str) -> Dict[str, str]:
+    path = Path(path)
     df = pd.read_csv(path)
     if file_col not in df.columns:
         raise ValueError(f"'{file_col}' not in {path}. "
@@ -42,6 +67,9 @@ def load_transcriptions_csv(path: Path,
     return out
 
 
+# ---------------------------------------------------------------------------
+# WAV discovery
+# ---------------------------------------------------------------------------
 def _discover_wavs(cfg) -> List[Tuple[Path, Optional[str]]]:
     wav_dir = Path(cfg.wav_dir)
     if not wav_dir.exists():
@@ -62,10 +90,28 @@ def _discover_wavs(cfg) -> List[Tuple[Path, Optional[str]]]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Master table
+# ---------------------------------------------------------------------------
 def build_master_table(cfg) -> pd.DataFrame:
     demo = pd.read_csv(cfg.demo_csv)
+
+    # --- normalise the label column name ---
+    label_col = cfg.resolved_label_col
+    if label_col not in demo.columns:
+        for cand in ("class1", "class2", "score", "target", "y", "Label", "LABEL"):
+            if cand in demo.columns:
+                print(f"[data] using '{cand}' as the label column "
+                      f"(requested '{label_col}')")
+                demo = demo.rename(columns={cand: label_col})
+                break
+        else:
+            raise ValueError(
+                f"'{label_col}' missing from {cfg.demo_csv}. "
+                f"Available: {list(demo.columns)}")
     if cfg.speaker_col not in demo.columns:
         raise ValueError(f"'{cfg.speaker_col}' missing from {cfg.demo_csv}")
+
     label_col = cfg.resolved_label_col
     if label_col not in demo.columns:
         raise ValueError(f"'{label_col}' missing from {cfg.demo_csv}. "
@@ -74,15 +120,21 @@ def build_master_table(cfg) -> pd.DataFrame:
     has_session_col = bool(cfg.session_col
                            and cfg.session_col in demo.columns)
 
+    # ---- NEW: pad the demo speaker column to match WAV filename form ----
+    demo = demo.assign(
+        __speaker_padded=demo[cfg.speaker_col].astype(str).apply(
+            lambda s: _pad_speaker(s, width=5)))
+
     if has_session_col:
         demo = demo.assign(
-            __join_key=(demo[cfg.speaker_col].astype(str) + "||"
+            __join_key=(demo["__speaker_padded"] + "||"
                         + demo[cfg.session_col].astype(str)))
-        demo = demo.drop_duplicates(subset=[cfg.speaker_col,
+        demo = demo.drop_duplicates(subset=["__speaker_padded",
                                             cfg.session_col])
     else:
-        demo = demo.assign(__join_key=demo[cfg.speaker_col].astype(str))
-        demo = demo.drop_duplicates(subset=[cfg.speaker_col])
+        demo = demo.assign(__join_key=demo["__speaker_padded"])
+        demo = demo.drop_duplicates(subset=["__speaker_padded"])
+    # ----------------------------------------------------------------------
 
     transcripts = load_transcriptions_csv(
         cfg.transcriptions_csv, cfg.transcript_file_col,
@@ -126,7 +178,8 @@ def build_master_table(cfg) -> pd.DataFrame:
             "transcript": transcripts.get(wav.stem, ""),
             **{c: drow[c] for c in demo.columns
                if c not in (cfg.speaker_col, cfg.session_col,
-                            "__join_key", label_col)},
+                            "__join_key", "__speaker_padded",
+                            label_col)},
         })
 
     df = pd.DataFrame(rows)
@@ -136,8 +189,10 @@ def build_master_table(cfg) -> pd.DataFrame:
 
     if unmatched:
         print(f"[data] WARNING: {len(unmatched)} WAV files were skipped")
+        for name, why in unmatched[:5]:
+            print(f"        {name}: {why}")
 
-    # map labels to a stable integer index and remember the mapping
+    # ---- map labels to a stable integer index ----
     labels = sorted(df["label"].unique())
     label2idx = {l: i for i, l in enumerate(labels)}
     df["label"] = df["label"].map(label2idx).astype(int)
@@ -167,6 +222,9 @@ def build_master_table(cfg) -> pd.DataFrame:
     return df
 
 
+# ---------------------------------------------------------------------------
+# Grouped folds
+# ---------------------------------------------------------------------------
 def grouped_folds(df: pd.DataFrame,
                   cfg) -> List[Tuple[np.ndarray, np.ndarray]]:
     unit_df = (df.groupby("speaker_id")
@@ -203,6 +261,9 @@ def grouped_folds(df: pd.DataFrame,
     return folds
 
 
+# ---------------------------------------------------------------------------
+# Unit aggregation
+# ---------------------------------------------------------------------------
 def aggregate_to_unit(df_eval: pd.DataFrame,
                       preds: np.ndarray,
                       task: str,
@@ -233,6 +294,10 @@ def aggregate_to_unit(df_eval: pd.DataFrame,
 
     return np.asarray(agg_preds), np.asarray(agg_labels), agg_keys
 
+
+# ---------------------------------------------------------------------------
+# OOF persistence
+# ---------------------------------------------------------------------------
 def save_oof_predictions(out_dir, model_name: str, fold_i: int,
                          df_eval: pd.DataFrame,
                          task: str,
@@ -250,7 +315,6 @@ def save_oof_predictions(out_dir, model_name: str, fold_i: int,
       file_stem, speaker_id, session_id, question_id, y_true, y_pred
       (classification)  logit_0..logit_{C-1}, prob_0..prob_{C-1}
     """
-    import csv
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"{model_name}_fold{fold_i}.csv"
