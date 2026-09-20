@@ -21,7 +21,27 @@ from fusion import (EarlyFusionBaseline, LateFusionBaseline,
                     GatedFusionBaseline, CrossAttentionBaseline)
 from models import MambaSeqClassifier, train_classical
 from novelty import ConfigurableMultiModal, resolve_novelty
-from training import MultiModalDataset, collate_pad, train_one_fold 
+from training import MultiModalDataset, collate_pad, train_one_fold
+
+
+# =====================================================================
+# Helpers
+# =====================================================================
+
+def _peek_dim(emb) -> int:
+    """Return the feature dim of any cached array, or 0 if empty."""
+    if emb is None or len(emb) == 0:
+        return 0
+    try:
+        return np.asarray(next(iter(emb.values()))).shape[-1]
+    except Exception:
+        return 0
+
+
+def _to_pooled(v) -> np.ndarray:
+    """(D,) -> (D,); (T, D) -> (D,)."""
+    v = np.asarray(v)
+    return v if v.ndim == 1 else v.mean(axis=0)
 
 
 # =====================================================================
@@ -110,7 +130,6 @@ def run_classical_experiment(name, model_type, df, folds, cfg, pooled):
     return fold_metrics, summary
 
 
-
 # =====================================================================
 # Sequence / fusion runner
 # =====================================================================
@@ -140,7 +159,7 @@ def run_sequence_experiment(name, model_builder, df, folds, cfg,
 
     for fold_i, (tr_idx, va_idx) in enumerate(folds):
         cfg._current_model_name = name
-        cfg._current_fold = fold_i 
+        cfg._current_fold = fold_i
 
         df_tr = df.loc[tr_idx].reset_index(drop=True)
         df_va = df.loc[va_idx].reset_index(drop=True)
@@ -151,8 +170,8 @@ def run_sequence_experiment(name, model_builder, df, folds, cfg,
         tab_tr = scaler.transform(tab_tr).astype(np.float32)
         tab_va = scaler.transform(tab_va).astype(np.float32)
 
-        d_a = next(iter(audio_emb.values())).shape[-1]
-        d_t = next(iter(text_emb.values())).shape[-1]
+        d_a = _peek_dim(audio_emb)
+        d_t = _peek_dim(text_emb)
         d_z = tab_tr.shape[-1]
 
         model = model_builder(d_a, d_t, d_z, cfg)
@@ -200,6 +219,8 @@ class ExperimentSpec:
     builder: Callable = None
     novelty_preset: str = None
     novelty_overrides: str = None
+    # skip on CPU if this experiment needs CUDA
+    needs_cuda: bool = False
 
 
 def default_experiments() -> List[ExperimentSpec]:
@@ -224,7 +245,7 @@ def default_experiments() -> List[ExperimentSpec]:
         ExperimentSpec(
             name="audio_mamba", family="baseline", kind="sequence",
             description="Audio SSL + Mamba",
-            use_audio=True),
+            use_audio=True, needs_cuda=True),
 
         # ---- fusion baselines ----
         ExperimentSpec(
@@ -258,7 +279,7 @@ def default_experiments() -> List[ExperimentSpec]:
         ExperimentSpec(
             name="tcm_mamba", family="novelty", kind="novelty",
             description="Full Temporal Cross-Modal Mamba",
-            novelty_preset="full"),
+            novelty_preset="full", needs_cuda=True),
     ]
 
 
@@ -267,16 +288,22 @@ def run_one_experiment(spec: ExperimentSpec, df, folds, cfg,
     print(f"\n{'=' * 70}\nEXPERIMENT: {spec.name} ({spec.family})\n"
           f"  {spec.description}\n{'=' * 70}")
 
+    # ---- skip CUDA-only experiments when running on CPU ----
+    if spec.needs_cuda and cfg.device == "cpu":
+        print(f"  [skip] {spec.name} requires CUDA; running on CPU")
+        return {"name": spec.name, "family": spec.family,
+                "description": spec.description,
+                "folds": [], "summary": [], "skipped": "needs_cuda"}
+
+    # ---- classical ----
     if spec.kind == "classical":
         if spec.pooled_source == "egemaps":
             pooled = {stem: egemaps_df.loc[stem].values.astype(np.float32)
                       for stem in egemaps_df.index}
         elif spec.pooled_source == "text":
-            pooled = {k: (v if v.ndim == 1 else v.mean(axis=0))
-                      for k, v in text_emb.items()}
+            pooled = {k: _to_pooled(v) for k, v in text_emb.items()}
         elif spec.pooled_source == "audio":
-            pooled = {k: (v if v.ndim == 1 else v.mean(axis=0))
-                      for k, v in audio_emb.items()}
+            pooled = {k: _to_pooled(v) for k, v in audio_emb.items()}
         else:
             raise ValueError(spec.pooled_source)
         fm, sm = run_classical_experiment(
@@ -285,13 +312,13 @@ def run_one_experiment(spec: ExperimentSpec, df, folds, cfg,
                 "description": spec.description,
                 "folds": fm, "summary": sm.to_dict("records")}
 
-    # sequence / novelty
+    # ---- sequence / novelty ----
     egemaps_arr = egemaps_df.values.astype(np.float32)
     egemaps_index = {s: i for i, s in enumerate(egemaps_df.index)}
 
     if spec.kind == "sequence" and spec.builder is None:
-        d_a = next(iter(audio_emb.values())).shape[-1]
-        d_t = next(iter(text_emb.values())).shape[-1]
+        d_a = _peek_dim(audio_emb)
+        d_t = _peek_dim(text_emb)
         use_audio = spec.use_audio
         builder = lambda a, t, z, c: _wrap_mamba(
             a if use_audio else t, c, use_audio)

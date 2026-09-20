@@ -40,7 +40,11 @@ class LazyEmbeddings:
 
     def __init__(self, cache_dir: Path | str, stems: Iterable[str]):
         self.cache_dir = Path(cache_dir)
-        self.stems: List[str] = list(stems)
+        # Only keep stems whose .npy actually exists on disk.
+        self.stems: List[str] = [
+            s for s in stems
+            if (self.cache_dir / f"{s}.npy").exists()
+        ]
 
     def _path(self, stem: str) -> Path:
         return self.cache_dir / f"{stem}.npy"

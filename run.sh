@@ -52,7 +52,7 @@ case "$MODE" in
     smoke)
         EPOCHS="${EPOCHS:-1}"
         BATCH_SIZE="${BATCH_SIZE:-1}"
-        MAX_FILES="${SMOKE_MAX_FILES:-10}"
+        MAX_FILES="${SMOKE_MAX_FILES:-20}"
 
         RESULTS_DIR="${SMOKE_RESULTS_DIR:-./smoke_results}"
         CACHE_DIR="${SMOKE_CACHE_DIR:-./smoke_cache}"

@@ -88,6 +88,24 @@ class MultiModalDataset(Dataset):
             self.label2idx = {l: i for i, l in enumerate(labels)}
             self.idx2label = {i: l for l, i in self.label2idx.items()}
 
+        # Fallback shapes for modalities that are missing for a given stem.
+        self._audio_dim = self._peek_dim(audio_emb)
+        self._text_dim  = self._peek_dim(text_emb)
+
+    @staticmethod
+    def _peek_dim(emb):
+        """Return the feature dim of any cached array, or 0 if empty."""
+        if emb is None:
+            return 0
+        stems = list(emb.keys()) if hasattr(emb, "keys") else []
+        for s in stems:
+            try:
+                a = emb[s]
+                return a.shape[-1]
+            except Exception:
+                continue
+        return 0
+
     def __len__(self) -> int:
         return len(self.df)
 
@@ -101,23 +119,28 @@ class MultiModalDataset(Dataset):
         row = self.df.iloc[idx]
         stem = row["file_stem"]
 
-        # --- audio ---
-        a = np.asarray(self.audio_emb[stem], dtype=np.float32)
-        a = _ensure_2d(a)                                    # (T_a, d_a)
-        a_mask = _ensure_mask(None, a.shape[0])
+                # --- audio (use zeros if missing) ---
+        if stem in self.audio_emb:
+            a = np.asarray(self.audio_emb[stem], dtype=np.float32)
+            a = _ensure_2d(a)
+            am = np.ones(a.shape[0], dtype=np.float32)
+        else:
+            a = np.zeros((1, self._audio_dim), dtype=np.float32)
+            am = np.zeros(1, dtype=np.float32)
 
-        # --- text ---
-        t = np.asarray(self.text_emb[stem], dtype=np.float32)
-        t = _ensure_2d(t)
-        t_mask = _ensure_mask(None, t.shape[0])
-
-        # --- tabular ---
-        z = self.tabular[idx]
+        # --- text (use zeros if missing) ---
+        if stem in self.text_emb:
+            t = np.asarray(self.text_emb[stem], dtype=np.float32)
+            t = _ensure_2d(t)
+            tm = np.ones(t.shape[0], dtype=np.float32)
+        else:
+            t = np.zeros((1, self._text_dim), dtype=np.float32)
+            tm = np.zeros(1, dtype=np.float32)
 
         return {
             "file_stem":  stem,
             "audio_seq":  torch.from_numpy(a),
-            "audio_mask": torch.from_numpy(a_mask),
+            "audio_mask": torch.from_numpy(am),
             "text_seq":   torch.from_numpy(t),
             "text_mask":  torch.from_numpy(t_mask),
             "tabular":    torch.from_numpy(z),
