@@ -122,6 +122,8 @@ def main():
                         default="mean")
     ap.add_argument("--embed-dtype", choices=["float16", "float32"],
                         default="float16")
+    ap.add_argument("--force-extract", action="store_true",
+                help="Ignore feature caches and re-extract everything.")
     args = ap.parse_args()
 
     # early exits

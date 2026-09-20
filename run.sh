@@ -38,6 +38,7 @@ AGGREGATE="${AGGREGATE:-true}"
 N_BOOTSTRAP="${N_BOOTSTRAP:-10000}"
 BOOTSTRAP_ALPHA="${BOOTSTRAP_ALPHA:-0.05}"
 BOOTSTRAP_SEED="${BOOTSTRAP_SEED:-42}"
+FORCE_EXTRACT="${FORCE_EXTRACT:-false}"
 
 
 # =============================================================================
@@ -57,6 +58,7 @@ case "$MODE" in
         CACHE_DIR="${SMOKE_CACHE_DIR:-./smoke_cache}"
 
         N_BOOTSTRAP="${SMOKE_N_BOOTSTRAP:-100}"
+        FORCE_EXTRACT="${FORCE_EXTRACT:-true}"
         ;;
 
     full)
@@ -481,6 +483,11 @@ if [[ "$SSL_HALF" == "true" ]]; then
 fi
 
 
+if [[ "$FORCE_EXTRACT" == "true" ]]; then
+    RUN_ARGS+=(--force-extract)
+fi
+
+
 # =============================================================================
 # Print configuration
 # =============================================================================
@@ -503,6 +510,7 @@ echo "SSL model         : $SSL_MODEL"
 echo "Device            : $DEVICE"
 echo "SSL pooling       : $SSL_POOL"
 echo "SSL half          : $SSL_HALF"
+echo "Force extract     : $FORCE_EXTRACT"
 echo "SSL chunk seconds : $SSL_CHUNK_SECONDS"
 
 echo "Text pooling      : $TEXT_POOL"
@@ -530,6 +538,7 @@ echo
 echo "============================================================"
 echo "COMMAND: python run.py"
 echo "============================================================"
+
 
 printf '  %q' python run.py "${RUN_ARGS[@]}"
 echo

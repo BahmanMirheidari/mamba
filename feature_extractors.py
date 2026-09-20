@@ -157,6 +157,7 @@ def extract_text_embeddings(df: pd.DataFrame,
     )
     cache = Path(cfg.cache_dir) / f"text_{safe}"
     cache.mkdir(parents=True, exist_ok=True)
+    force = bool(getattr(cfg, "force_extract", False))
 
     try:
         from transformers import AutoTokenizer, AutoModel
@@ -174,7 +175,7 @@ def extract_text_embeddings(df: pd.DataFrame,
             stem = row["file_stem"]
             npy  = cache / f"{stem}.npy"
 
-            if npy.exists():
+            if npy.exists() and not force:
                 seen_stems.append(stem)
                 continue
 
@@ -216,6 +217,13 @@ def extract_text_embeddings(df: pd.DataFrame,
         del model
         if str(cfg.device).startswith("cuda"):
             torch.cuda.empty_cache()
+
+        # NEW — drop stems with missing .npy files
+        before = len(seen_stems)
+        seen_stems = [s for s in seen_stems if (cache / f"{s}.npy").exists()]
+        if before != len(seen_stems):
+            print(f"[text:{safe}] dropped {before - len(seen_stems)} stems "
+                  f"with missing .npy files")
 
         return LazyEmbeddings(cache, seen_stems)
 
@@ -310,6 +318,7 @@ def extract_ssl_embeddings(df: pd.DataFrame, cfg) -> LazyEmbeddings:
     )
     cache = Path(cfg.cache_dir) / f"ssl_{safe}"
     cache.mkdir(parents=True, exist_ok=True)
+    force = bool(getattr(cfg, "force_extract", False))
 
     try:
         model = _load_ssl_model(cfg.ssl_model_name, cfg.device, half=half)
@@ -320,7 +329,7 @@ def extract_ssl_embeddings(df: pd.DataFrame, cfg) -> LazyEmbeddings:
             stem = row["file_stem"]
             npy  = cache / f"{stem}.npy"
 
-            if npy.exists():
+            if npy.exists() and not force:
                 seen_stems.append(stem)
                 continue
 
@@ -360,6 +369,13 @@ def extract_ssl_embeddings(df: pd.DataFrame, cfg) -> LazyEmbeddings:
         if str(cfg.device).startswith("cuda"):
             torch.cuda.empty_cache()
 
+        # NEW — drop stems with missing .npy files
+        before = len(seen_stems)
+        seen_stems = [s for s in seen_stems if (cache / f"{s}.npy").exists()]
+        if before != len(seen_stems):
+            print(f"[ssl:{safe}] dropped {before - len(seen_stems)} stems "
+                  f"with missing .npy files")
+
         return LazyEmbeddings(cache, seen_stems)
 
     except Exception:
@@ -381,7 +397,8 @@ def extract_egemaps(df: pd.DataFrame, cfg) -> pd.DataFrame:
     try:
         import opensmile
 
-        if cache.exists():
+        force = bool(getattr(cfg, "force_extract", False))
+        if cache.exists() and not force:
             cached = pd.read_csv(cache, index_col=0)
             if set(df["file_stem"]).issubset(cached.index):
                 print(f"[egemaps] loaded cache ({cached.shape})")

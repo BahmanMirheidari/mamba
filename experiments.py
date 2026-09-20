@@ -272,9 +272,11 @@ def run_one_experiment(spec: ExperimentSpec, df, folds, cfg,
             pooled = {stem: egemaps_df.loc[stem].values.astype(np.float32)
                       for stem in egemaps_df.index}
         elif spec.pooled_source == "text":
-            pooled = {k: v.mean(axis=0) for k, v in text_emb.items()}
+            pooled = {k: (v if v.ndim == 1 else v.mean(axis=0))
+                      for k, v in text_emb.items()}
         elif spec.pooled_source == "audio":
-            pooled = {k: v.mean(axis=0) for k, v in audio_emb.items()}
+            pooled = {k: (v if v.ndim == 1 else v.mean(axis=0))
+                      for k, v in audio_emb.items()}
         else:
             raise ValueError(spec.pooled_source)
         fm, sm = run_classical_experiment(
