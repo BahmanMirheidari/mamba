@@ -1,80 +1,50 @@
 """
-Experiment registry and runner.
-
-Every experiment has:
-    name:       unique identifier
-    family:     'baseline' | 'fusion' | 'novelty'
-    build:      function(d_a, d_t, d_z, cfg) -> nn.Module
-    description: str
+Experiment registry and runner — speaker-level throughout.
 """
 from dataclasses import dataclass
-from typing import Callable, Dict, List
+from typing import Callable, List
 
 import numpy as np
 import torch
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader
 
-from data_utils import aggregate_to_unit, save_oof_predictions
+from data_utils import save_oof_predictions
 from evaluation import compute_metrics, aggregate_fold_metrics
 from fusion import (EarlyFusionBaseline, LateFusionBaseline,
                     GatedFusionBaseline, CrossAttentionBaseline)
 from models import MambaSeqClassifier, train_classical
 from novelty import ConfigurableMultiModal, resolve_novelty
-from training import MultiModalDataset, collate_pad, train_one_fold
+from training import SpeakerSequenceDataset, collate_pad, train_one_fold
+from pathlib import Path
+import traceback
 
+# ---------------------------------------------------------------------------
+# Classical (speaker-level, using pooled features)
+# ---------------------------------------------------------------------------
 
-# =====================================================================
-# Helpers
-# =====================================================================
-
-def _peek_dim(emb) -> int:
-    """Return the feature dim of any cached array, or 0 if empty."""
-    if emb is None or len(emb) == 0:
-        return 0
-    try:
-        return np.asarray(next(iter(emb.values()))).shape[-1]
-    except Exception:
-        return 0
-
-
-def _to_pooled(v) -> np.ndarray:
-    """(D,) -> (D,); (T, D) -> (D,)."""
-    v = np.asarray(v)
-    return v if v.ndim == 1 else v.mean(axis=0)
-
-
-# =====================================================================
-# Classical runner (XGB / LGBM / LogReg on pooled features)
-# =====================================================================
-
-def run_classical_experiment(name, model_type, df, folds, cfg, pooled):
+def run_classical_experiment(name, model_type, speaker_df, folds, cfg,
+                             pooled):
     """
-    pooled: {file_stem: np.ndarray[D]}
-    Writes per-fold OOF CSVs to cfg.output_dir/oof/.
-    """
-    from pathlib import Path
+    pooled: {speaker_id: np.ndarray[D]}
+    """ 
 
     fold_metrics = []
-    unit = cfg.resolved_aggregation_unit
 
     for fold_i, (tr_idx, va_idx) in enumerate(folds):
-        cfg._current_model_name = name
-        cfg._current_fold = fold_i
+        df_tr = speaker_df.loc[tr_idx].reset_index(drop=True)
+        df_va = speaker_df.loc[va_idx].reset_index(drop=True)
 
-        df_tr = df.loc[tr_idx].reset_index(drop=True)
-        df_va = df.loc[va_idx].reset_index(drop=True)
-
-        tr_keep = [s for s in df_tr["file_stem"] if s in pooled]
-        va_keep = [s for s in df_va["file_stem"] if s in pooled]
+        tr_keep = [s for s in df_tr["speaker_id"] if s in pooled]
+        va_keep = [s for s in df_va["speaker_id"] if s in pooled]
         if not tr_keep or not va_keep:
             print(f"  fold {fold_i}: no features, skipping")
             continue
 
         X_tr = np.stack([pooled[s] for s in tr_keep])
         X_va = np.stack([pooled[s] for s in va_keep])
-        df_tr_k = df_tr[df_tr["file_stem"].isin(tr_keep)].reset_index(drop=True)
-        df_va_k = df_va[df_va["file_stem"].isin(va_keep)].reset_index(drop=True)
+        df_tr_k = df_tr[df_tr["speaker_id"].isin(tr_keep)].reset_index(drop=True)
+        df_va_k = df_va[df_va["speaker_id"].isin(va_keep)].reset_index(drop=True)
 
         if cfg.task == "classification":
             labels = sorted(df_tr_k["label"].unique())
@@ -84,55 +54,45 @@ def run_classical_experiment(name, model_type, df, folds, cfg, pooled):
             y_tr = df_tr_k["label"].values.astype(float)
 
         _, pred = train_classical(X_tr, y_tr, X_va, model_type)
-
-        # ---- derive pseudo-logits from probs ----
         prob_arr = np.asarray(pred, dtype=float)
+
         if cfg.task == "classification":
             eps = 1e-7
-            p_clipped = np.clip(prob_arr, eps, 1 - eps)
-            logit_arr = np.log(p_clipped / (1 - p_clipped))
+            p_clip = np.clip(prob_arr, eps, 1 - eps)
+            logit_arr = np.log(p_clip / (1 - p_clip))
         else:
             logit_arr = None
 
-        # ---- persist OOF ----
         try:
             if cfg.task == "classification":
                 save_oof_predictions(
                     out_dir=Path(cfg.output_dir) / "oof",
-                    model_name=name,
-                    fold_i=fold_i,
-                    df_eval=df_va_k,
-                    task=cfg.task,
-                    probs=prob_arr,
-                    logits=logit_arr)
+                    model_name=name, fold_i=fold_i,
+                    df_eval=df_va_k, task=cfg.task,
+                    probs=prob_arr, logits=logit_arr)
             else:
                 save_oof_predictions(
                     out_dir=Path(cfg.output_dir) / "oof",
-                    model_name=name,
-                    fold_i=fold_i,
-                    df_eval=df_va_k,
-                    task=cfg.task,
+                    model_name=name, fold_i=fold_i,
+                    df_eval=df_va_k, task=cfg.task,
                     y_pred=prob_arr)
         except Exception as e:
             print(f"  [OOF] save failed: {e}")
 
-        agg_preds, agg_labels, agg_keys = aggregate_to_unit(
-            df_va_k, pred, cfg.task, unit)
-
-        m = compute_metrics(agg_labels, agg_preds, cfg.task)
+        m = compute_metrics(df_va_k["label"].values, prob_arr, cfg.task)
         m["fold"] = fold_i
-        m["n_units"] = len(agg_keys)
+        m["n_speakers"] = len(df_va_k)
         fold_metrics.append(m)
-        print(f"  fold {fold_i}: " + ", ".join(
+        print(f"  fold {fold_i} ({len(df_va_k)} speakers): " + ", ".join(
             f"{k}={v:.4f}" for k, v in m.items() if isinstance(v, float)))
 
     summary = aggregate_fold_metrics(fold_metrics)
     return fold_metrics, summary
 
 
-# =====================================================================
-# Sequence / fusion runner
-# =====================================================================
+# ---------------------------------------------------------------------------
+# Sequence / novelty runner
+# ---------------------------------------------------------------------------
 
 def _wrap_mamba(d_in, cfg, use_audio: bool):
     class _W(torch.nn.Module):
@@ -152,32 +112,47 @@ def _wrap_mamba(d_in, cfg, use_audio: bool):
     return _W()
 
 
-def run_sequence_experiment(name, model_builder, df, folds, cfg,
-                            audio_emb, text_emb, tabular_arr,
-                            tabular_index):
+def run_sequence_experiment(name, model_builder, speaker_df, folds, cfg):
     fold_metrics = []
 
     for fold_i, (tr_idx, va_idx) in enumerate(folds):
         cfg._current_model_name = name
         cfg._current_fold = fold_i
 
-        df_tr = df.loc[tr_idx].reset_index(drop=True)
-        df_va = df.loc[va_idx].reset_index(drop=True)
+        df_tr = speaker_df.loc[tr_idx].reset_index(drop=True)
+        df_va = speaker_df.loc[va_idx].reset_index(drop=True)
 
-        tab_tr = tabular_arr[[tabular_index[s] for s in df_tr["file_stem"]]]
-        tab_va = tabular_arr[[tabular_index[s] for s in df_va["file_stem"]]]
+        # ---- guard: drop rows with empty sequences in this fold ----
+        def _has_seqs(row):
+            return len(row["audio_seqs"]) > 0 and len(row["text_seqs"]) > 0
+
+        df_tr = df_tr[df_tr.apply(_has_seqs, axis=1)].reset_index(drop=True)
+        df_va = df_va[df_va.apply(_has_seqs, axis=1)].reset_index(drop=True)
+
+        if len(df_tr) == 0 or len(df_va) == 0:
+            print(f"  fold {fold_i}: empty train or val after filtering "
+                  f"(train={len(df_tr)}, val={len(df_va)}); skipping")
+            continue
+
+        # scale tabular on train only
+        tab_tr = np.stack(df_tr["tabular"].values)
         scaler = StandardScaler().fit(tab_tr)
-        tab_tr = scaler.transform(tab_tr).astype(np.float32)
-        tab_va = scaler.transform(tab_va).astype(np.float32)
+        df_tr = df_tr.copy()
+        df_va = df_va.copy()
+        df_tr["tabular"] = [scaler.transform(t[None, :])[0]
+                            for t in df_tr["tabular"]]
+        df_va["tabular"] = [scaler.transform(t[None, :])[0]
+                            for t in df_va["tabular"]]
 
-        d_a = _peek_dim(audio_emb)
-        d_t = _peek_dim(text_emb)
-        d_z = tab_tr.shape[-1]
+        # infer dims from the first valid row of this fold
+        d_a = df_tr.iloc[0]["audio_seqs"][0].shape[1]
+        d_t = df_tr.iloc[0]["text_seqs"][0].shape[1]
+        d_z = df_tr.iloc[0]["tabular"].shape[0] 
 
         model = model_builder(d_a, d_t, d_z, cfg)
 
-        ds_tr = MultiModalDataset(df_tr, audio_emb, text_emb, tab_tr, cfg)
-        ds_va = MultiModalDataset(df_va, audio_emb, text_emb, tab_va, cfg)
+        ds_tr = SpeakerSequenceDataset(df_tr, cfg)
+        ds_va = SpeakerSequenceDataset(df_va, cfg)
         if cfg.task == "classification":
             ds_va.label2idx = ds_tr.label2idx
 
@@ -186,172 +161,139 @@ def run_sequence_experiment(name, model_builder, df, folds, cfg,
         va_loader = DataLoader(ds_va, batch_size=cfg.batch_size,
                                shuffle=False, collate_fn=collate_pad)
 
-        print(f"  fold {fold_i}: training ...")
-        agg_preds, agg_labels, agg_keys, _ = train_one_fold(
+        print(f"  fold {fold_i}: training on {len(df_tr)} speakers "
+              f"(val={len(df_va)}) ...")
+        val_probs, val_labels, val_speakers, _ = train_one_fold(
             model, tr_loader, va_loader, cfg, val_df=df_va, verbose=True)
 
-        m = compute_metrics(agg_labels, agg_preds, cfg.task)
+        m = compute_metrics(val_labels, val_probs, cfg.task)
         m["fold"] = fold_i
-        m["n_units"] = len(agg_keys)
+        m["n_speakers"] = len(val_labels)
         fold_metrics.append(m)
-        print(f"  fold {fold_i}: " + ", ".join(
+        print(f"  fold {fold_i} ({len(val_labels)} speakers): " + ", ".join(
             f"{k}={v:.4f}" for k, v in m.items() if isinstance(v, float)))
 
     summary = aggregate_fold_metrics(fold_metrics)
     return fold_metrics, summary
 
 
-# =====================================================================
+# ---------------------------------------------------------------------------
 # Experiment specs
-# =====================================================================
+# ---------------------------------------------------------------------------
 
 @dataclass
 class ExperimentSpec:
     name: str
-    family: str          # baseline | fusion | novelty
-    kind: str            # 'classical' | 'sequence' | 'novelty'
+    family: str
+    kind: str             # classical | sequence | novelty
     description: str
-    # classical
-    pooled_source: str = None       # 'egemaps' | 'text' | 'audio'
-    model_type: str = None          # 'xgboost' | 'lightgbm' | 'logreg'
-    # sequence / novelty
+    pooled_source: str = None   # egemaps | text | audio
+    model_type: str = None
     use_audio: bool = None
     builder: Callable = None
     novelty_preset: str = None
     novelty_overrides: str = None
-    # skip on CPU if this experiment needs CUDA
-    needs_cuda: bool = False
 
 
 def default_experiments() -> List[ExperimentSpec]:
     return [
-        # ---- baselines ----
-        ExperimentSpec(
-            name="egemaps_xgb", family="baseline", kind="classical",
-            description="eGeMAPS + XGBoost",
-            pooled_source="egemaps", model_type="xgboost"),
-        ExperimentSpec(
-            name="egemaps_lgbm", family="baseline", kind="classical",
-            description="eGeMAPS + LightGBM",
-            pooled_source="egemaps", model_type="lightgbm"),
-        ExperimentSpec(
-            name="text_logreg", family="baseline", kind="classical",
-            description="Text embeddings + Logistic Regression",
-            pooled_source="text", model_type="logreg"),
-        ExperimentSpec(
-            name="text_xgb", family="baseline", kind="classical",
-            description="Text embeddings + XGBoost",
-            pooled_source="text", model_type="xgboost"),
-        ExperimentSpec(
-            name="audio_mamba", family="baseline", kind="sequence",
-            description="Audio SSL + Mamba",
-            use_audio=True, needs_cuda=True),
-
-        # ---- fusion baselines ----
-        ExperimentSpec(
-            name="early_fusion", family="fusion", kind="sequence",
-            description="Pooled concat + MLP",
-            builder=lambda d_a, d_t, d_z, c:
-                EarlyFusionBaseline(d_a, d_t, d_z, c.n_outputs,
-                                    d_model=c.fusion_d_model)),
-        ExperimentSpec(
-            name="late_fusion", family="fusion", kind="sequence",
-            description="Separate heads + learned weights",
-            builder=lambda d_a, d_t, d_z, c:
-                LateFusionBaseline(d_a, d_t, d_z, c.n_outputs,
-                                   dropout=c.fusion_dropout)),
-        ExperimentSpec(
-            name="gated_fusion", family="fusion", kind="sequence",
-            description="Softmax gate over pooled modalities",
-            builder=lambda d_a, d_t, d_z, c:
-                GatedFusionBaseline(d_a, d_t, d_z, c.n_outputs,
-                                    d_model=c.fusion_d_model)),
-        ExperimentSpec(
-            name="cross_attention", family="fusion", kind="sequence",
-            description="Audio queries text, pooled + tabular",
-            builder=lambda d_a, d_t, d_z, c:
-                CrossAttentionBaseline(d_a, d_t, d_z, c.n_outputs,
-                                       d_model=c.fusion_d_model,
-                                       n_heads=c.fusion_n_heads,
-                                       dropout=c.fusion_dropout)),
-
-        # ---- the novel model ----
-        ExperimentSpec(
-            name="tcm_mamba", family="novelty", kind="novelty",
-            description="Full Temporal Cross-Modal Mamba",
-            novelty_preset="full", needs_cuda=True),
+        ExperimentSpec(name="egemaps_xgb", family="baseline",
+                       kind="classical", description="eGeMAPS + XGBoost",
+                       pooled_source="egemaps", model_type="xgboost"),
+        ExperimentSpec(name="egemaps_lgbm", family="baseline",
+                       kind="classical", description="eGeMAPS + LightGBM",
+                       pooled_source="egemaps", model_type="lightgbm"),
+        ExperimentSpec(name="text_logreg", family="baseline",
+                       kind="classical",
+                       description="Text embeddings + Logistic Regression",
+                       pooled_source="text", model_type="logreg"),
+        ExperimentSpec(name="text_xgb", family="baseline",
+                       kind="classical", description="Text + XGBoost",
+                       pooled_source="text", model_type="xgboost"),
+        ExperimentSpec(name="audio_mamba", family="baseline",
+                       kind="sequence", description="Audio SSL + Mamba",
+                       use_audio=True),
+        ExperimentSpec(name="early_fusion", family="fusion",
+                       kind="sequence", description="Pooled concat + MLP",
+                       builder=lambda a, t, z, c:
+                           EarlyFusionBaseline(a, t, z, c.n_outputs,
+                                               d_model=c.fusion_d_model)),
+        ExperimentSpec(name="late_fusion", family="fusion",
+                       kind="sequence", description="Separate heads",
+                       builder=lambda a, t, z, c:
+                           LateFusionBaseline(a, t, z, c.n_outputs,
+                                              dropout=c.fusion_dropout)),
+        ExperimentSpec(name="gated_fusion", family="fusion",
+                       kind="sequence", description="Softmax gate",
+                       builder=lambda a, t, z, c:
+                           GatedFusionBaseline(a, t, z, c.n_outputs,
+                                               d_model=c.fusion_d_model)),
+        ExperimentSpec(name="cross_attention", family="fusion",
+                       kind="sequence", description="Audio queries text",
+                       builder=lambda a, t, z, c:
+                           CrossAttentionBaseline(a, t, z, c.n_outputs,
+                                                  d_model=c.fusion_d_model,
+                                                  n_heads=c.fusion_n_heads,
+                                                  dropout=c.fusion_dropout)),
+        ExperimentSpec(name="tcm_mamba", family="novelty",
+                       kind="novelty",
+                       description="Full Temporal Cross-Modal Mamba",
+                       novelty_preset="full"),
     ]
 
 
-def run_one_experiment(spec: ExperimentSpec, df, folds, cfg,
-                       egemaps_df, audio_emb, text_emb, primary_text):
+def run_one_experiment(spec, speaker_df, folds, cfg, primary_text):
     print(f"\n{'=' * 70}\nEXPERIMENT: {spec.name} ({spec.family})\n"
           f"  {spec.description}\n{'=' * 70}")
 
-    # ---- skip CUDA-only experiments when running on CPU ----
-    if spec.needs_cuda and cfg.device == "cpu":
-        print(f"  [skip] {spec.name} requires CUDA; running on CPU")
-        return {"name": spec.name, "family": spec.family,
-                "description": spec.description,
-                "folds": [], "summary": [], "skipped": "needs_cuda"}
-
-    # ---- classical ----
     if spec.kind == "classical":
-        if spec.pooled_source == "egemaps":
-            pooled = {stem: egemaps_df.loc[stem].values.astype(np.float32)
-                      for stem in egemaps_df.index}
-        elif spec.pooled_source == "text":
-            pooled = {k: _to_pooled(v) for k, v in text_emb.items()}
-        elif spec.pooled_source == "audio":
-            pooled = {k: _to_pooled(v) for k, v in audio_emb.items()}
-        else:
-            raise ValueError(spec.pooled_source)
+        # pooled feature per speaker for classical models
+        pooled = {}
+        for _, row in speaker_df.iterrows():
+            if spec.pooled_source == "egemaps":
+                pooled[row["speaker_id"]] = row["tabular"]
+            elif spec.pooled_source == "text":
+                pooled[row["speaker_id"]] = np.mean(
+                    np.stack([t.mean(0) for t in row["text_seqs"]], 0), 0)
+            elif spec.pooled_source == "audio":
+                pooled[row["speaker_id"]] = np.mean(
+                    np.stack([a.mean(0) for a in row["audio_seqs"]], 0), 0)
+            else:
+                raise ValueError(spec.pooled_source)
         fm, sm = run_classical_experiment(
-            spec.name, spec.model_type, df, folds, cfg, pooled)
+            spec.name, spec.model_type, speaker_df, folds, cfg, pooled)
         return {"name": spec.name, "family": spec.family,
                 "description": spec.description,
                 "folds": fm, "summary": sm.to_dict("records")}
 
-    # ---- sequence / novelty ----
-    egemaps_arr = egemaps_df.values.astype(np.float32)
-    egemaps_index = {s: i for i, s in enumerate(egemaps_df.index)}
-
     if spec.kind == "sequence" and spec.builder is None:
-        d_a = _peek_dim(audio_emb)
-        d_t = _peek_dim(text_emb)
         use_audio = spec.use_audio
         builder = lambda a, t, z, c: _wrap_mamba(
             a if use_audio else t, c, use_audio)
     elif spec.kind == "novelty":
-        builder = lambda d_a, d_t, d_z, c: ConfigurableMultiModal(
-            d_a, d_t, d_z, c.n_outputs,
+        builder = lambda a, t, z, c: ConfigurableMultiModal(
+            a, t, z, c.n_outputs,
             resolve_novelty(spec.novelty_preset, spec.novelty_overrides),
             d_model=c.fusion_d_model)
     else:
         builder = spec.builder
 
     fm, sm = run_sequence_experiment(
-        spec.name, builder, df, folds, cfg,
-        audio_emb, text_emb, egemaps_arr, egemaps_index)
+        spec.name, builder, speaker_df, folds, cfg)
     return {"name": spec.name, "family": spec.family,
             "description": spec.description,
             "folds": fm, "summary": sm.to_dict("records")}
 
 
-def run_all_experiments(df, folds, cfg, egemaps_df, audio_emb, text_emb,
-                        primary_text, specs=None):
+def run_all_experiments(speaker_df, folds, cfg, primary_text, specs=None):
     if specs is None:
         specs = default_experiments()
-
     results = {}
     for spec in specs:
         try:
-            r = run_one_experiment(spec, df, folds, cfg,
-                                   egemaps_df, audio_emb, text_emb,
-                                   primary_text)
-            results[spec.name] = r
+            results[spec.name] = run_one_experiment(
+                spec, speaker_df, folds, cfg, primary_text)
         except Exception as e:
-            import traceback
             print(f"[ERROR] {spec.name} failed: {e}")
             traceback.print_exc()
     return results

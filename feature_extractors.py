@@ -1,22 +1,28 @@
 """
 feature_extractors.py
 
-Feature extraction for the mamba pipeline.
+Feature extraction for the speaker-level mamba pipeline.
 
 Extractors, in the order they should be called:
-    1. extract_text_embeddings   -> LazyEmbeddings (pooled text vectors)
-    2. extract_ssl_embeddings    -> LazyEmbeddings (pooled speech vectors)
-    3. extract_egemaps           -> pd.DataFrame   (functionals)
-
-Orchestrator:
-    extract_all_features(df, cfg) -> dict with keys 'text', 'ssl', 'egemaps'
+    1. extract_text_embeddings   -> dict[stem, (T, D)]  float16
+    2. extract_ssl_embeddings    -> dict[stem, (T, D)]  float16
+    3. extract_egemaps           -> pd.DataFrame        functionals
 
 Each extractor has one top-level try/except that prints a full traceback
 and returns an empty result on failure, so one broken stage never aborts
 the others. The caller decides what to do with missing features.
+
+Design contract
+---------------
+Every embedding returned by the text and SSL extractors is a SEQUENCE
+of shape (T, D). Pooling to (D,) is the caller's job — models that need
+pooled input pool inside their forward pass; classical models pool in
+run_one_experiment.
+
+This contract is what makes both the classical and sequence paths work.
 """
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -25,86 +31,7 @@ import traceback
 
 
 # =========================================================================
-# Lazy dict-like view over a directory of .npy files
-# =========================================================================
-class LazyEmbeddings:
-    """
-    Dict-compatible view over a cache directory of .npy files.
-
-    Supports: emb[stem], stem in emb, len(emb), iter(emb),
-              .keys()/.items()/.values()/.get(), .dim(), .stack()
-
-    Each __getitem__ hits disk. That keeps peak memory at one array
-    regardless of dataset size.
-    """
-
-    def __init__(self, cache_dir: Path | str, stems: Iterable[str]):
-        self.cache_dir = Path(cache_dir)
-        # Only keep stems whose .npy actually exists on disk.
-        self.stems: List[str] = [
-            s for s in stems
-            if (self.cache_dir / f"{s}.npy").exists()
-        ]
-
-    def _path(self, stem: str) -> Path:
-        return self.cache_dir / f"{stem}.npy"
-
-    def __getitem__(self, stem: str) -> np.ndarray:
-        return np.load(self._path(stem))
-
-    def __contains__(self, stem: str) -> bool:
-        return stem in self.stems
-
-    def __len__(self) -> int:
-        return len(self.stems)
-
-    def __iter__(self):
-        return iter(self.stems)
-
-    def __repr__(self) -> str:
-        return f"LazyEmbeddings(n={len(self.stems)}, dir={self.cache_dir})"
-
-    def keys(self):
-        return self.stems
-
-    def items(self):
-        for stem in self.stems:
-            yield stem, self[stem]
-
-    def values(self):
-        for stem in self.stems:
-            yield self[stem]
-
-    def get(self, stem: str, default=None):
-        return self[stem] if stem in self.stems else default
-
-    def dim(self) -> Optional[int]:
-        if not self.stems:
-            return None
-        return self[self.stems[0]].shape[-1]
-
-    def stack(self, dtype: str = "float32") -> np.ndarray:
-        """
-        Materialize all embeddings as (N, D). Only call this if the full
-        matrix fits in RAM. Raises if the cached arrays are sequences
-        (i.e. pooling was disabled at extraction time).
-        """
-        if not self.stems:
-            return np.zeros((0, 0), dtype=dtype)
-        first = self[self.stems[0]]
-        if first.ndim != 1:
-            raise ValueError(
-                f"stack() expects pooled 1-D embeddings, got {first.shape}. "
-                "Re-extract with pooling enabled."
-            )
-        out = np.empty((len(self.stems), first.shape[0]), dtype=dtype)
-        for i, stem in enumerate(self.stems):
-            out[i] = self[stem]
-        return out
-
-
-# =========================================================================
-# Pooling helpers
+# Pooling helpers — used by callers, not by the extractors
 # =========================================================================
 def mean_pool(seq: np.ndarray) -> np.ndarray:
     """Mean over time. (T, D) -> (D,). No-op on 1-D input."""
@@ -119,7 +46,7 @@ def mean_pool_text(seq: np.ndarray,
     if mask is None:
         return seq.mean(axis=0)
     m = mask.astype(np.float32)[:, None]
-    denom = np.clip(m.sum(), 1e-9, None)     # two bounds: works on numpy 1.x and 2.x
+    denom = np.clip(m.sum(), 1e-9, None)
     return (seq * m).sum(axis=0) / denom
 
 
@@ -137,108 +64,81 @@ def _maybe_cast(arr: np.ndarray, dtype: str) -> np.ndarray:
 
 
 # =========================================================================
-# 1. Text embeddings
+# 1. Text embeddings — return sequences (T, D)
 # =========================================================================
 @torch.no_grad()
-def extract_text_embeddings(df: pd.DataFrame,
-                            model_name: str,
-                            cfg) -> LazyEmbeddings:
+def extract_text_embeddings(df, model_name, cfg):
     """
-    Extract text embeddings for every row of df using `model_name`.
+    Returns {file_stem: np.ndarray of shape (T, D)}.
 
-    Cache layout:
-        <cfg.cache_dir>/text_<model>_len<max>_<pool>_<dtype>/<stem>.npy
+    T = number of tokens the tokenizer produced (<= cfg.text_max_length).
+    D = hidden size of the text encoder (768 for BERT-base family).
 
-    Returned shape per file:
-        pooled  -> (D,)
-        sequence-> (T, D)   (only if cfg.text_pool == "none")
+    Nothing is pooled here. Callers that need a single vector per chunk
+    call mean_pool_text / cls_pool_text themselves.
     """
-    safe = (
-        model_name.replace("/", "_")
-        + f"_len{cfg.text_max_length}"
-        + f"_{getattr(cfg, 'text_pool', 'mean')}"
-        + f"_{getattr(cfg, 'embed_dtype', 'float16')}"
-    )
+    from transformers import AutoTokenizer, AutoModel
+
+    safe = model_name.replace("/", "_")
     cache = Path(cfg.cache_dir) / f"text_{safe}"
     cache.mkdir(parents=True, exist_ok=True)
+
     force = bool(getattr(cfg, "force_extract", False))
 
     try:
-        from transformers import AutoTokenizer, AutoModel
-
-        pool_mode = str(getattr(cfg, "text_pool", "mean")).lower()
-        dtype     = str(getattr(cfg, "embed_dtype", "float16"))
-
         tok = AutoTokenizer.from_pretrained(model_name)
         model = AutoModel.from_pretrained(model_name).to(cfg.device)
         model.eval()
 
-        seen_stems: List[str] = []
-
+        out: Dict[str, np.ndarray] = {}
         for i, row in df.iterrows():
             stem = row["file_stem"]
-            npy  = cache / f"{stem}.npy"
+            npy = cache / f"{stem}.npy"
 
             if npy.exists() and not force:
-                seen_stems.append(stem)
+                out[stem] = np.load(npy)
                 continue
 
-            text = row.get("transcript")
+            text = row["transcript"]
             if not isinstance(text, str) or not text.strip():
                 continue
 
             enc = tok(text, return_tensors="pt", truncation=True,
                       max_length=cfg.text_max_length, padding=False)
             enc = {k: v.to(cfg.device) for k, v in enc.items()}
+            try:
+                h = model(**enc).last_hidden_state.squeeze(0)   # [T, D]
+            except Exception as e:
+                print(f"[text] failed on {stem}: {e}")
+                continue
 
-            h = model(**enc).last_hidden_state.squeeze(0)     # (T, D)
-            arr = h.detach().float().cpu().numpy()
-
-            if pool_mode == "mean":
-                mask = enc["attention_mask"].squeeze(0).cpu().numpy()
-                arr = mean_pool_text(arr, mask)
-            elif pool_mode == "cls":
-                arr = cls_pool_text(arr)
-            # "none" -> keep (T, D)
-
-            arr = _maybe_cast(arr, dtype)
+            # ---- keep the full sequence; do NOT pool here ----
+            arr = h.detach().float().cpu().numpy()              # (T, D)
+            arr = _maybe_cast(arr, str(getattr(cfg, "embed_dtype",
+                                               "float16")))
             np.save(npy, arr)
-
-            del enc, h, arr
-            if str(cfg.device).startswith("cuda"):
-                torch.cuda.empty_cache()
-
-            seen_stems.append(stem)
+            out[stem] = arr
 
             if (i + 1) % 100 == 0:
                 print(f"[text:{safe}] {i + 1}/{len(df)}")
 
-        if seen_stems:
-            sample = np.load(cache / f"{seen_stems[0]}.npy")
-            print(f"[text:{safe}] {len(seen_stems)} sequences cached in "
-                  f"{cache} (shape={sample.shape}, dtype={sample.dtype})")
-
+        if out:
+            sample = next(iter(out.values()))
+            print(f"[text:{safe}] {len(out)} sequences cached in {cache} "
+                  f"(shape={sample.shape}, dtype={sample.dtype})")
         del model
         if str(cfg.device).startswith("cuda"):
             torch.cuda.empty_cache()
-
-        # NEW — drop stems with missing .npy files
-        before = len(seen_stems)
-        seen_stems = [s for s in seen_stems if (cache / f"{s}.npy").exists()]
-        if before != len(seen_stems):
-            print(f"[text:{safe}] dropped {before - len(seen_stems)} stems "
-                  f"with missing .npy files")
-
-        return LazyEmbeddings(cache, seen_stems)
+        return out
 
     except Exception:
         print(f"[text:{safe}] FAILED for {model_name}")
         traceback.print_exc()
-        return LazyEmbeddings(cache, [])
+        return {}
 
 
 # =========================================================================
-# 2. SSL embeddings
+# 2. SSL embeddings — return sequences (T, D)
 # =========================================================================
 def _load_ssl_model(model_name: str, device: str, half: bool = False):
     from transformers import Wav2Vec2Model, HubertModel, WhisperModel
@@ -260,9 +160,7 @@ def _load_ssl_model(model_name: str, device: str, half: bool = False):
 @torch.no_grad()
 def _ssl_forward_chunked(model, wav: torch.Tensor, cfg) -> torch.Tensor:
     """
-    Run an SSL model over (1, T) in chunks. Bounds attention memory to
-    O(chunk^2). Set cfg.ssl_chunk_seconds above the longest clip to
-    disable chunking entirely. Returns CPU tensor (T_out, D).
+    Run an SSL model over (1, T) in overlapping chunks, return (T_out, D).
     """
     chunk_seconds = float(getattr(cfg, "ssl_chunk_seconds", 30.0))
     chunk_len = max(1, int(chunk_seconds * cfg.ssl_sample_rate))
@@ -296,45 +194,41 @@ def _ssl_forward_chunked(model, wav: torch.Tensor, cfg) -> torch.Tensor:
 
 
 @torch.no_grad()
-def extract_ssl_embeddings(df: pd.DataFrame, cfg) -> LazyEmbeddings:
+def extract_ssl_embeddings(df: pd.DataFrame, cfg) -> Dict[str, np.ndarray]:
     """
-    Extract SSL hidden states per file, pool, save as .npy.
+    Returns {file_stem: np.ndarray of shape (T, D)}.
 
-    Cache layout:
-        <cfg.cache_dir>/ssl_<model>_sr<sr>_max<sec>_pool<n>_<dtype>/<stem>.npy
+    T = number of SSL frames (about 50 per second at 16 kHz for wav2vec2).
+    D = hidden size (768 for wav2vec2-base, 1024 for wav2vec2-large).
 
-    Returned shape per file:
-        pooled  -> (D,)
-        sequence-> (T, D)   (only if cfg.ssl_pool is False)
+    Nothing is pooled here. Callers pool when they need to.
     """
     import torchaudio
 
-    pool = bool(getattr(cfg, "ssl_pool", True))
     dtype = str(getattr(cfg, "embed_dtype", "float16"))
-    half  = bool(getattr(cfg, "ssl_half", False))
+    half = bool(getattr(cfg, "ssl_half", False))
 
+    # Cache key: encoder + preprocessing settings that change the output.
     safe = (
         cfg.ssl_model_name.replace("/", "_")
         + f"_sr{cfg.ssl_sample_rate}"
         + f"_max{int(cfg.max_audio_seconds)}"
-        + f"_pool{int(pool)}"
         + f"_{dtype}"
     )
     cache = Path(cfg.cache_dir) / f"ssl_{safe}"
     cache.mkdir(parents=True, exist_ok=True)
     force = bool(getattr(cfg, "force_extract", False))
 
+    out: Dict[str, np.ndarray] = {}
     try:
         model = _load_ssl_model(cfg.ssl_model_name, cfg.device, half=half)
 
-        seen_stems: List[str] = []
-
         for i, row in df.iterrows():
             stem = row["file_stem"]
-            npy  = cache / f"{stem}.npy"
+            npy = cache / f"{stem}.npy"
 
             if npy.exists() and not force:
-                seen_stems.append(stem)
+                out[stem] = np.load(npy)
                 continue
 
             wav, sr = torchaudio.load(str(row["file_path"]))
@@ -348,48 +242,38 @@ def extract_ssl_embeddings(df: pd.DataFrame, cfg) -> LazyEmbeddings:
             if wav.shape[1] > max_len:
                 wav = wav[:, :max_len]
 
-            h = _ssl_forward_chunked(model, wav, cfg)   # (T, D) on CPU
+            h = _ssl_forward_chunked(model, wav, cfg)   # (T, D) CPU float32
             arr = h.numpy()
-            if pool:
-                arr = mean_pool(arr)                    # (D,)
+            # ---- keep the full sequence; do NOT pool here ----
             arr = _maybe_cast(arr, dtype)
             np.save(npy, arr)
+            out[stem] = arr
 
             del wav, h, arr
             if str(cfg.device).startswith("cuda"):
                 torch.cuda.empty_cache()
 
-            seen_stems.append(stem)
-
             if (i + 1) % 100 == 0:
                 print(f"[ssl:{safe}] {i + 1}/{len(df)}")
 
-        if seen_stems:
-            sample = np.load(cache / f"{seen_stems[0]}.npy")
-            print(f"[ssl:{safe}] {len(seen_stems)} sequences cached in "
-                  f"{cache} (shape={sample.shape}, dtype={sample.dtype})")
+        if out:
+            sample = next(iter(out.values()))
+            print(f"[ssl:{safe}] {len(out)} sequences cached in {cache} "
+                  f"(shape={sample.shape}, dtype={sample.dtype})")
 
         del model
         if str(cfg.device).startswith("cuda"):
             torch.cuda.empty_cache()
-
-        # NEW — drop stems with missing .npy files
-        before = len(seen_stems)
-        seen_stems = [s for s in seen_stems if (cache / f"{s}.npy").exists()]
-        if before != len(seen_stems):
-            print(f"[ssl:{safe}] dropped {before - len(seen_stems)} stems "
-                  f"with missing .npy files")
-
-        return LazyEmbeddings(cache, seen_stems)
+        return out
 
     except Exception:
         print(f"[ssl:{safe}] FAILED for {cfg.ssl_model_name}")
         traceback.print_exc()
-        return LazyEmbeddings(cache, [])
+        return {}
 
 
 # =========================================================================
-# 3. eGeMAPS
+# 3. eGeMAPS — one row of functionals per file (tabular, unchanged)
 # =========================================================================
 def extract_egemaps(df: pd.DataFrame, cfg) -> pd.DataFrame:
     """
@@ -435,7 +319,7 @@ def extract_egemaps(df: pd.DataFrame, cfg) -> pd.DataFrame:
 
 
 # =========================================================================
-# Orchestrator — text first, then SSL, then eGeMAPS
+# Orchestrator
 # =========================================================================
 def extract_all_features(df: pd.DataFrame,
                          cfg,
@@ -444,23 +328,11 @@ def extract_all_features(df: pd.DataFrame,
     """
     Run all three extractors in order: text, ssl, egemaps.
 
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Must contain file_stem, file_path, transcript columns.
-    cfg : SimpleNamespace / dataclass
-        Must expose cache_dir, text_max_length, text_pool, embed_dtype,
-        device, ssl_model_name, ssl_sample_rate, max_audio_seconds,
-        ssl_pool, ssl_chunk_seconds, ssl_half.
-    text_models : list[str] | None
-        Hugging Face model IDs for text. If None, uses cfg.text_models
-        if present, otherwise a safe default.
-
     Returns
     -------
     dict with keys:
-        'text'    -> dict[model_name, LazyEmbeddings]
-        'ssl'     -> LazyEmbeddings
+        'text'    -> dict[model_name, dict[stem, (T, D)]]
+        'ssl'     -> dict[stem, (T, D)]
         'egemaps' -> pd.DataFrame
     """
     if text_models is None:
@@ -470,31 +342,27 @@ def extract_all_features(df: pd.DataFrame,
 
     results: Dict[str, object] = {
         "text": {},
-        "ssl": LazyEmbeddings(cfg.cache_dir, []),
+        "ssl": {},
         "egemaps": pd.DataFrame(),
     }
 
-    # ---- 1. TEXT FIRST ----
     print("\n[features] text embeddings ...")
     for name in text_models:
         emb = extract_text_embeddings(df, name, cfg)
         results["text"][name] = emb
         print(f"  {name}: {len(emb)} sequences")
 
-    # ---- 2. SSL ----
     print("\n[features] ssl embeddings ...")
     results["ssl"] = extract_ssl_embeddings(df, cfg)
     print(f"  {cfg.ssl_model_name}: {len(results['ssl'])} sequences")
 
-    # ---- 3. eGeMAPS ----
     print("\n[features] egemaps ...")
     results["egemaps"] = extract_egemaps(df, cfg)
     print(f"  egemaps: {len(results['egemaps'])} rows")
 
-    # ---- summary + sanity check ----
     n_text = sum(len(v) for v in results["text"].values())
-    n_ssl  = len(results["ssl"])
-    n_eg   = len(results["egemaps"])
+    n_ssl = len(results["ssl"])
+    n_eg = len(results["egemaps"])
 
     print("\n[features] summary:")
     print(f"  text  : {n_text} files across "
@@ -507,15 +375,11 @@ def extract_all_features(df: pd.DataFrame,
             "All feature extractors returned empty results. "
             "See the tracebacks above for the root cause."
         )
-
     if n_text == 0:
-        print("[features] WARNING: no text embeddings; continuing with "
-              "SSL/eGeMAPS only.")
+        print("[features] WARNING: no text embeddings.")
     if n_ssl == 0:
-        print("[features] WARNING: no SSL embeddings; continuing with "
-              "text/eGeMAPS only.")
+        print("[features] WARNING: no SSL embeddings.")
     if n_eg == 0:
-        print("[features] WARNING: no eGeMAPS; continuing with "
-              "text/SSL only.")
+        print("[features] WARNING: no eGeMAPS.")
 
     return results

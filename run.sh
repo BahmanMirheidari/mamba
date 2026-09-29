@@ -573,8 +573,7 @@ if [[ "$AGGREGATE" == "true" ]]; then
         AGG_ARGS=(
             --results-dir "$RESULTS_DIR"
             --task "$TASK"
-            --n-classes "$N_CLASSES"
-            --aggregation-unit "$AGG_UNIT"
+            --n-classes "$N_CLASSES" 
             --n-bootstrap "$N_BOOTSTRAP"
             --alpha "$BOOTSTRAP_ALPHA"
             --seed "$BOOTSTRAP_SEED"
