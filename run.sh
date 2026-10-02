@@ -540,11 +540,11 @@ echo "COMMAND: python run.py"
 echo "============================================================"
 
 
-printf '  %q' python run.py "${RUN_ARGS[@]}"
+printf '  %q' python -X faulthandler -u run.py "${RUN_ARGS[@]}"
 echo
 echo
 
-python run.py "${RUN_ARGS[@]}"
+python -X faulthandler -u run.py "${RUN_ARGS[@]}"
 
 
 echo
@@ -585,11 +585,11 @@ if [[ "$AGGREGATE" == "true" ]]; then
         echo "COMMAND: python aggregate.py"
         echo "============================================================"
 
-        printf '  %q' python aggregate.py "${AGG_ARGS[@]}"
+        printf '  %q' python -X faulthandler -u aggregate.py "${AGG_ARGS[@]}"
         echo
         echo
 
-        python aggregate.py "${AGG_ARGS[@]}"
+        python -X faulthandler -u aggregate.py "${AGG_ARGS[@]}"
 
 
         echo
@@ -620,3 +620,5 @@ echo "Mode    : $MODE"
 echo "Results : $RESULTS_DIR"
 echo "Cache   : $CACHE_DIR"
 echo
+# conda activate mamba-torch26
+# OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 N_FOLDS=5 EPOCHS=30 BATCH_SIZE=8 ./run.sh full
