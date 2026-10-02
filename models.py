@@ -7,14 +7,29 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as F 
 
+MAMBA_AVAILABLE = False
 try:
     from mamba_ssm import Mamba
     MAMBA_AVAILABLE = True
+
+    # ---- force the Python reference selective scan ----
+    # mamba-ssm chooses its implementation once, at import time.
+    # The CUDA kernel can segfault on some torch/CUDA combinations.
+    # Swap it for the reference implementation after import.
+    import mamba_ssm.ops.selective_scan_interface as _ssi
+    if hasattr(_ssi, "selective_scan_ref"):
+        _ssi.selective_scan_fn = _ssi.selective_scan_ref
+        print("[mamba] swapped selective_scan_fn → selective_scan_ref "
+              "(Python reference implementation)")
+    else:
+        print("[mamba] selective_scan_ref not found in mamba_ssm — "
+              "cannot disable the fast path")
+
 except ImportError:
-    MAMBA_AVAILABLE = False
-    print("[models] mamba-ssm not installed — Mamba will not be available")
+    print("[models] mamba-ssm not installed — Mamba models will error "
+          "at construction time")
 
 
 def train_classical(X_tr, y_tr, X_va, model_type: str = "xgboost", **kwargs):
